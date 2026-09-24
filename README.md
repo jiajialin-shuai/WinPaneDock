@@ -4,6 +4,22 @@ Windows 桌面终端工作区管理器。WPF 界面嵌入官方 Windows Terminal
 
 项目目前处于开发阶段，0.1.6.0 开发版仅在作者的 Windows x64 电脑上验证过。仓库中的源码不是可直接安装的正式发布版本。
 
+## 界面示意
+
+以下是合成示意图，不是程序实拍。图中的项目、路径、命令和终端输出均为虚构示例；界面细节可能与当前版本不同。
+
+**双 Pane 工作区**
+
+![双 Pane 工作区示意图](docs/images/workspace-two-panes.png)
+
+**四 Pane 工作区**
+
+![四 Pane 工作区示意图](docs/images/workspace-four-panes.png)
+
+**命令面板**
+
+![命令面板示意图](docs/images/command-palette.png)
+
 ## 使用
 
 - 首次启动自动建立 Group 并运行 PowerShell 7。顶部可选 Profile；`+ Group` 与 Split 使用当前选择启动独立终端。
