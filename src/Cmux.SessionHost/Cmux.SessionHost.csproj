@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>Cmux.SessionHost</AssemblyName>
+    <PlatformTarget>x64</PlatformTarget>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Cmux.Terminal/Cmux.Terminal.csproj" />
+  </ItemGroup>
+  <Target Name="CopyOpenConsole" AfterTargets="Build">
+    <Exec Command="pwsh -NoProfile -File &quot;$(MSBuildProjectDirectory)\..\..\scripts\Copy-OpenConsole.ps1&quot; -Destination &quot;$(TargetDir)OpenConsole.exe&quot;" />
+  </Target>
+</Project>

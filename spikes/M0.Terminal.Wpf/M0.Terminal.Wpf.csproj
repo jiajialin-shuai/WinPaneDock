@@ -1,0 +1,64 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    M0 Spike: 官方 Windows Terminal WPF 控件 (Fallback Path)
+    Roadmap 依据: CMUX-Windows-ROADMAP.md #2 TerminalControl 技术门槛 -> Fallback Path
+    包内容已验证: CI.Microsoft.Terminal.Wpf 内含
+      - lib/net8.0-windows7.0/Microsoft.Terminal.Wpf.dll   (官方 WPF HwndHost 托管层, src/cascadia/WpfTerminalControl)
+      - runtimes/win-x64/native/Microsoft.Terminal.Control.dll (官方原生渲染器, Windows Terminal 同款)
+    本项目不实现任何 VT Parser / 字体渲染 / ConPTY, 符合 Roadmap #12 架构原则。
+  -->
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
+    <!-- WPF owns DPI awareness through app.manifest; WinForms is used only for NotifyIcon. -->
+    <NoWarn>$(NoWarn);WFAC010</NoWarn>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>Cmux.Spike.Terminal</AssemblyName>
+    <RootNamespace>Cmux.Spike.Terminal</RootNamespace>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>../../packaging/Assets/Cmux.ico</ApplicationIcon>
+    <PlatformTarget>x64</PlatformTarget>
+    <LangVersion>latest</LangVersion>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../../src/Cmux.Core/Cmux.Core.csproj" />
+    <ProjectReference Include="../../src/Cmux.Terminal/Cmux.Terminal.csproj" />
+    <ProjectReference Include="../../src/Cmux.SessionHost/Cmux.SessionHost.csproj" ReferenceOutputAssembly="false" />
+    <ProjectReference Include="../../src/Cmux.Cli/Cmux.Cli.csproj" ReferenceOutputAssembly="false" />
+    <PackageReference Include="CI.Microsoft.Terminal.Wpf" Version="1.25.260303002" />
+  </ItemGroup>
+
+  <Target Name="CopyOpenConsole" AfterTargets="Build">
+    <Exec Command="pwsh -NoProfile -File &quot;$(MSBuildProjectDirectory)\..\..\scripts\Copy-OpenConsole.ps1&quot; -Destination &quot;$(TargetDir)OpenConsole.exe&quot;" />
+  </Target>
+
+  <Target Name="CopyCmuxCli" AfterTargets="Build">
+    <ItemGroup>
+      <CliFiles Include="$(MSBuildProjectDirectory)\..\..\src\Cmux.Cli\bin\$(Configuration)\net8.0\cmux.exe" />
+      <CliFiles Include="$(MSBuildProjectDirectory)\..\..\src\Cmux.Cli\bin\$(Configuration)\net8.0\cmux.dll" />
+      <CliFiles Include="$(MSBuildProjectDirectory)\..\..\src\Cmux.Cli\bin\$(Configuration)\net8.0\cmux.deps.json" />
+      <CliFiles Include="$(MSBuildProjectDirectory)\..\..\src\Cmux.Cli\bin\$(Configuration)\net8.0\cmux.runtimeconfig.json" />
+    </ItemGroup>
+    <Copy SourceFiles="@(CliFiles)" DestinationFolder="$(TargetDir)" />
+  </Target>
+
+  <Target Name="CopySessionHost" AfterTargets="Build">
+    <ItemGroup>
+      <HostFiles Include="$(MSBuildProjectDirectory)\..\..\src\Cmux.SessionHost\bin\$(Configuration)\net8.0-windows\Cmux.SessionHost.exe" />
+      <HostFiles Include="$(MSBuildProjectDirectory)\..\..\src\Cmux.SessionHost\bin\$(Configuration)\net8.0-windows\Cmux.SessionHost.dll" />
+      <HostFiles Include="$(MSBuildProjectDirectory)\..\..\src\Cmux.SessionHost\bin\$(Configuration)\net8.0-windows\Cmux.SessionHost.deps.json" />
+      <HostFiles Include="$(MSBuildProjectDirectory)\..\..\src\Cmux.SessionHost\bin\$(Configuration)\net8.0-windows\Cmux.SessionHost.runtimeconfig.json" />
+    </ItemGroup>
+    <Copy SourceFiles="@(HostFiles)" DestinationFolder="$(TargetDir)" SkipUnchangedFiles="true" />
+  </Target>
+  <ItemGroup>
+    <None Include="cmux-prompt.ps1" CopyToOutputDirectory="PreserveNewest" />
+    <Resource Include="Assets\sidebar-ornament-dual.png" />
+  </ItemGroup>
+
+</Project>
