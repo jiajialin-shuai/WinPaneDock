@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.IO;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
@@ -13,7 +14,9 @@ using Brushes = System.Windows.Media.Brushes;
 using Cursors = System.Windows.Input.Cursors;
 using Size = System.Windows.Size;
 using Clipboard = System.Windows.Clipboard;
+using OpenFolderDialog = Microsoft.Win32.OpenFolderDialog;
 using Cmux.Core;
+using Cmux.Terminal;
 using Microsoft.Terminal.Wpf;
 
 namespace Cmux.Spike.Terminal;
@@ -30,6 +33,9 @@ public partial class MainWindow : Window
         public System.Windows.Controls.Button CloseButton { get; } = new() { Content = "×", ToolTip = "Close this terminal", Padding = new Thickness(8, 0, 8, 0) };
         public int Number { get; set; }
         public ConptyConnection? Connection { get; set; }
+        public bool ControlAttached { get; set; }
+        /// <summary>The connection was bound before the control built its native terminal, so the first paint was dropped.</summary>
+        public bool NeedsOutputReplay { get; set; }
         public string? LastCommandLine { get; set; }
         public string? LastWorkingDirectory { get; set; }
         public string? CurrentDirectory { get; set; }
@@ -66,7 +72,12 @@ public partial class MainWindow : Window
     }
 
     private sealed record SidebarTerminalItem(string Name, System.Windows.Media.Brush DotBrush, string StatusText);
-    private sealed record SidebarItem(Workspace Workspace, string Name, string? Branch, SidebarTerminalItem[] Terminals);
+    private sealed record StatusProbe(PaneState Pane, ConptyConnection? Connection, int ProcessId,
+        string CommandLine, string ProfileName);
+    private sealed record LaunchState(string ProfileName, string CommandLine, string WorkingDirectory, string Title);
+    private sealed record PendingLaunchClear(Guid WorkspaceId, Guid TabId, Guid SessionId, LaunchState State);
+    private sealed record SidebarGroupItem(string Name, SidebarTerminalItem[] Terminals);
+    private sealed record SidebarItem(Workspace Workspace, string Name, string? Branch, SidebarGroupItem[] Groups);
     private sealed record PaletteCommand(string Label, Action Run);
 
     private readonly Dictionary<Guid, TabState> _tabs = [];
@@ -82,28 +93,31 @@ public partial class MainWindow : Window
     private TerminalSettings? _settings;
     private readonly DispatcherTimer _statusTimer;
     private readonly DispatcherTimer _gitTimer;
+    private bool _statusRefreshing;
+    private int _statusGeneration;
     private readonly Dictionary<Guid, GitProjectContext?> _gitContexts = [];
     private readonly Dictionary<string, GitProjectContext?> _directoryGitContexts = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, string?> _gitWorktreeRoots = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, DateTimeOffset> _gitRootResolvedAt = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, DateTimeOffset> _gitResolutionFailures = new(StringComparer.OrdinalIgnoreCase);
+    private readonly SemaphoreSlim _gitQueryGate = new(4, 4);
     private bool _gitRefreshing;
     private readonly string? _requestedProfile;
     private readonly string? _legacyCommandLine;
-    private readonly int _lifecycleSmokeCycles;
-    private readonly bool _tabSmoke;
-    private readonly bool _paneSmoke;
-    private readonly bool _m2GateSmoke;
-    private readonly bool _eventSmoke;
-    private readonly bool _notificationSmoke;
-    private readonly bool _cwdSmoke;
-    private readonly bool _paletteSmoke;
-    private readonly bool _saveEnabled;
+    private readonly SmokeOptions _smoke;
     private readonly LayoutStore _layoutStore;
     private readonly AgentEventServer _eventServer;
     private readonly GuiCommandServer _guiCommandServer;
     private readonly System.Windows.Forms.NotifyIcon _notifyIcon;
+    private readonly System.Drawing.Icon _appIcon;
     private AgentEvent? _pendingNotification;
     private int _waitingNotificationCount;
     private readonly DispatcherTimer _saveTimer;
     private bool _restoring;
+    private bool _layoutSaveBlocked;
+    private readonly HashSet<Guid> _closingSessions = [];
+    private string? _lastSaveError;
+    private string? _layoutRecoveryNotice;
     private string? _lastCommandLine { get => _activePane?.LastCommandLine; set { if (_activePane is not null) _activePane.LastCommandLine = value; } }
     private string? _lastWorkingDirectory { get => _activePane?.LastWorkingDirectory; set { if (_activePane is not null) _activePane.LastWorkingDirectory = value; } }
     private string? _lastProfileName { get => _activePane?.LastProfileName; set { if (_activePane is not null) _activePane.LastProfileName = value; } }
@@ -122,6 +136,9 @@ public partial class MainWindow : Window
 
     public MainWindow()
     {
+        var commandLineArgs = Environment.GetCommandLineArgs();
+        var instanceOption = ReadOption(commandLineArgs, "--instance-id");
+        if (instanceOption is not null) InstanceScope.Configure(instanceOption);
         _focus = new Cmux.Core.FocusManager(_workspaces);
         InitializeComponent();
         ComponentDispatcher.ThreadFilterMessage += OnThreadFilterMessage;
@@ -130,30 +147,25 @@ public partial class MainWindow : Window
         _fontOverride = font;
         _requestedProfile = profile;
         _legacyCommandLine = commandLine;
-        _lifecycleSmokeCycles = ParseSmokeCycles(Environment.GetCommandLineArgs());
-        _tabSmoke = Environment.GetCommandLineArgs().Contains("--tab-smoke");
-        _paneSmoke = Environment.GetCommandLineArgs().Contains("--pane-smoke");
-        _m2GateSmoke = Environment.GetCommandLineArgs().Contains("--m2-gate-smoke");
-        _eventSmoke = Environment.GetCommandLineArgs().Contains("--event-smoke");
-        _notificationSmoke = Environment.GetCommandLineArgs().Contains("--notification-smoke");
-        _cwdSmoke = Environment.GetCommandLineArgs().Contains("--cwd-smoke");
-        _paletteSmoke = Environment.GetCommandLineArgs().Contains("--palette-smoke");
-        _saveEnabled = _lifecycleSmokeCycles == 0 && !_tabSmoke && !_paneSmoke && !_m2GateSmoke && !_eventSmoke && !_notificationSmoke && !_cwdSmoke && !_paletteSmoke;
+        _smoke = SmokeOptions.Parse(commandLineArgs);
         var layoutPath = ReadOption(Environment.GetCommandLineArgs(), "--layout-path") ?? Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "cmux", "workspace-state.json");
         _layoutStore = new LayoutStore(layoutPath);
         _eventServer = new AgentEventServer(agentEvent => Dispatcher.Invoke(() => HandleAgentEvent(agentEvent)));
         _guiCommandServer = new GuiCommandServer(command => Dispatcher.Invoke(() => ExecuteGuiCommand(command)));
+        using var iconStream = System.Windows.Application.GetResourceStream(
+            new Uri("pack://application:,,,/Assets/Cmux.ico")).Stream;
+        _appIcon = new System.Drawing.Icon(iconStream);
         _notifyIcon = new System.Windows.Forms.NotifyIcon
         {
-            Icon = System.Drawing.SystemIcons.Application,
-            Text = "cmux",
+            Icon = _appIcon,
+            Text = "WinPaneDock",
             Visible = true,
         };
         _notifyIcon.BalloonTipClicked += (_, _) => Dispatcher.Invoke(NavigateToPendingNotification);
         _saveTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(700) };
         _saveTimer.Tick += (_, _) => SaveLayout();
-        Title = "cmux — Select profile";
+        Title = "WinPaneDock — Select profile";
 
         Loaded += OnLoaded;
         Closing += OnClosing;
@@ -168,7 +180,7 @@ public partial class MainWindow : Window
         Deactivated += (_, _) => UnregisterWindowHotkeys();
 
         _statusTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(500) };
-        _statusTimer.Tick += (_, _) => UpdateStatus();
+        _statusTimer.Tick += (_, _) => QueueStatusUpdate();
         _statusTimer.Start();
         _gitTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(5) };
         _gitTimer.Tick += async (_, _) => await RefreshGitContextsAsync();
@@ -185,7 +197,13 @@ public partial class MainWindow : Window
             var savedTheme = File.Exists(ThemePath) ? File.ReadAllText(ThemePath).Trim() : "Night";
             ThemePicker.SelectedIndex = savedTheme switch { "Day" => 1, "Gray" => 2, _ => 0 };
             WorkspaceRootInput.Text = Environment.CurrentDirectory;
-            var snapshot = _saveEnabled ? _layoutStore.Load() : null;
+            var snapshot = _smoke.AllowsLayoutPersistence ? _layoutStore.Load() : null;
+            if (_layoutStore.LastRecoveryMessage is { } recoveryMessage)
+            {
+                _layoutRecoveryNotice = $"LAYOUT RECOVERED: {recoveryMessage}";
+                App.Log($"Layout recovered from backup: {recoveryMessage}");
+                StatusText.Text = _layoutRecoveryNotice;
+            }
             if (snapshot is { Workspaces.Length: > 0 })
             {
                 _restoring = true;
@@ -199,31 +217,37 @@ public partial class MainWindow : Window
                 CreateTab(initial);
             }
             RefreshWorkspaces();
-            if (_saveEnabled)
+            App.Diagnostics.Write(DiagnosticLevel.Info, "gui.ready",
+                $"workspaces={_workspaces.Workspaces.Count} restoring={_restoring}");
+            if (_smoke.AllowsLayoutPersistence)
             {
                 _gitTimer.Start();
                 _ = RefreshGitContextsAsync();
             }
             ProfilePicker.SelectedItem = ((IReadOnlyList<TerminalProfile>)ProfilePicker.ItemsSource)
                 .FirstOrDefault(p => p.Name == "PowerShell 7") ?? ProfilePicker.Items[0];
-            StatusText.Text = $"Ready. Config: {ProfileStore.FilePath}";
-            if (_paletteSmoke)
+            StatusText.Text = _layoutRecoveryNotice ?? $"Ready. Config: {ProfileStore.FilePath}";
+            if (_smoke.PaletteGate)
                 Dispatcher.BeginInvoke(new Action(async () => await RunPaletteSmokeAsync()));
-            else if (_cwdSmoke)
+            else if (_smoke.ReattachGate)
+                Dispatcher.BeginInvoke(new Action(async () => await RunReattachSmokeAsync()));
+            else if (_smoke.ReplayGate)
+                Dispatcher.BeginInvoke(new Action(async () => await RunReplaySmokeAsync()));
+            else if (_smoke.CwdGate)
                 Dispatcher.BeginInvoke(new Action(async () => await RunCwdSmokeAsync()));
-            else if (_notificationSmoke)
+            else if (_smoke.NotificationGate)
                 Dispatcher.BeginInvoke(new Action(async () => await RunNotificationSmokeAsync()));
-            else if (_eventSmoke)
+            else if (_smoke.EventGate)
                 Dispatcher.BeginInvoke(new Action(async () => await RunEventSmokeAsync()));
             else if (_restoring)
                 Dispatcher.BeginInvoke(new Action(async () => await RestoreShellsAsync()));
-            else if (_m2GateSmoke)
+            else if (_smoke.M2Gate)
                 Dispatcher.BeginInvoke(new Action(async () => await RunM2GateSmokeAsync()));
-            else if (_paneSmoke)
+            else if (_smoke.PaneGate)
                 Dispatcher.BeginInvoke(new Action(async () => await RunPaneSmokeAsync()));
-            else if (_tabSmoke)
+            else if (_smoke.TabGate)
                 Dispatcher.BeginInvoke(new Action(async () => await RunTabSmokeAsync()));
-            else if (_lifecycleSmokeCycles > 0)
+            else if (_smoke.LifecycleCycles > 0)
                 Dispatcher.BeginInvoke(new Action(async () => await RunLifecycleSmokeAsync()));
             else if (_legacyCommandLine is not null)
                 StartTerminal(_legacyCommandLine, Environment.CurrentDirectory, "Custom");
@@ -235,10 +259,29 @@ public partial class MainWindow : Window
                 ProfilePicker.SelectedItem = selected;
                 StartProfile(selected);
             }
-            else if (snapshot is not { Workspaces.Length: > 0 } && _saveEnabled &&
+            else if (snapshot is not { Workspaces.Length: > 0 } && _smoke.AllowsLayoutPersistence &&
                      ProfilePicker.SelectedItem is TerminalProfile defaultProfile)
                 StartProfile(defaultProfile);
             if (!_restoring) MarkLayoutDirty();
+        }
+        catch (LayoutRecoveryException ex)
+        {
+            _layoutSaveBlocked = true;
+            _lastSaveError = ex.Message;
+            App.Log($"Layout recovery blocked persistence: {ex}");
+            StatusText.Text = "LAYOUT RECOVERY FAILED: primary and backup are invalid; files were preserved and saving is disabled.";
+            WorkspaceMessage.Foreground = System.Windows.Media.Brushes.LightCoral;
+            WorkspaceMessage.Text = "The existing layout could not be recovered. Rename or remove the invalid files before restarting; this session will not overwrite them.";
+            try
+            {
+                var initial = _workspaces.Create("Default", Environment.CurrentDirectory);
+                CreateTab(initial);
+                RefreshWorkspaces();
+            }
+            catch (Exception initializationError)
+            {
+                App.Log($"Could not create recovery workspace: {initializationError}");
+            }
         }
         catch (Exception ex)
         {
@@ -310,7 +353,7 @@ public partial class MainWindow : Window
             }
         }
         if (_windowSource is not null) ApplyWindowChrome(_windowSource.Handle, theme != "Day");
-        if (_saveEnabled)
+        if (_smoke.AllowsLayoutPersistence)
         {
             Directory.CreateDirectory(Path.GetDirectoryName(ThemePath)!);
             File.WriteAllText(ThemePath, theme);
@@ -423,6 +466,10 @@ public partial class MainWindow : Window
                     {
                         var root = Directory.Exists(request.Directory) ? request.Directory : Environment.CurrentDirectory;
                         CreateTab(_workspaces.Create(request.Argument, root));
+                        RefreshWorkspaces();
+                        // Same contract as the dialog: a brand new workspace must come up
+                        // with a live terminal in its first pane.
+                        if (ProfilePicker.SelectedItem is TerminalProfile profile) StartProfile(profile);
                     }
                     RefreshWorkspaces();
                     MarkLayoutDirty();
@@ -519,8 +566,49 @@ public partial class MainWindow : Window
         NewWorkspaceNameInput.Clear();
         NewWorkspaceRootInput.Text = _workspaces.Active?.RootDirectory ?? Environment.CurrentDirectory;
         NewWorkspaceError.Text = "";
+        NewWorkspaceScrim.Visibility = Visibility.Visible;
         NewWorkspacePopup.IsOpen = true;
         NewWorkspaceNameInput.Focus();
+    }
+
+    private void CloseNewWorkspacePopup()
+    {
+        NewWorkspacePopup.IsOpen = false;
+        NewWorkspaceScrim.Visibility = Visibility.Collapsed;
+    }
+
+    private void OnNewWorkspaceScrimClick(object sender, MouseButtonEventArgs e) => CloseNewWorkspacePopup();
+
+    private void OnNewWorkspaceKeyDown(object sender, System.Windows.Input.KeyEventArgs e)
+    {
+        switch (e.Key)
+        {
+            case Key.Escape:
+                e.Handled = true;
+                CloseNewWorkspacePopup();
+                break;
+            case Key.Enter:
+                e.Handled = true;
+                OnCreateWorkspaceClicked(this, new RoutedEventArgs());
+                break;
+        }
+    }
+
+    private void OnBrowseWorkspaceRootClicked(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            var dialog = new OpenFolderDialog
+            {
+                Title = "Select workspace root directory",
+                Multiselect = false,
+                InitialDirectory = Directory.Exists(NewWorkspaceRootInput.Text)
+                    ? NewWorkspaceRootInput.Text
+                    : Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
+            };
+            if (dialog.ShowDialog(this) == true) NewWorkspaceRootInput.Text = dialog.FolderName;
+        }
+        catch (Exception ex) { NewWorkspaceError.Text = $"Folder picker failed: {ex.Message}"; }
     }
 
     private void OnCreateWorkspaceClicked(object sender, RoutedEventArgs e)
@@ -529,14 +617,18 @@ public partial class MainWindow : Window
         {
             var workspace = _workspaces.Create(NewWorkspaceNameInput.Text, NewWorkspaceRootInput.Text);
             CreateTab(workspace);
-            NewWorkspacePopup.IsOpen = false;
+            App.Diagnostics.Write(DiagnosticLevel.Info, "workspace.created", $"workspaceId={workspace.Id}");
+            CloseNewWorkspacePopup();
             RefreshWorkspaces();
             MarkLayoutDirty();
+            // CreateTab only builds the pane tree; the shell is a separate ConPTY launch.
+            // Without this the new workspace opens on a blank pane until the user hits Start.
+            if (ProfilePicker.SelectedItem is TerminalProfile profile) StartProfile(profile);
         }
         catch (Exception ex) { NewWorkspaceError.Text = ex.Message; }
     }
 
-    private void OnCancelNewWorkspaceClicked(object sender, RoutedEventArgs e) => NewWorkspacePopup.IsOpen = false;
+    private void OnCancelNewWorkspaceClicked(object sender, RoutedEventArgs e) => CloseNewWorkspacePopup();
 
     private void OnApplyRootClicked(object sender, RoutedEventArgs e) => ChangeWorkspace(() =>
     {
@@ -551,23 +643,45 @@ public partial class MainWindow : Window
     private void OnDeleteWorkspaceClicked(object sender, RoutedEventArgs e) => ChangeWorkspace(() =>
     {
         var workspace = SelectedWorkspace;
-        foreach (var tab in workspace.Tabs)
+        var states = workspace.Tabs.Select(tab => _tabs[tab.Id]).ToArray();
+        var pending = CaptureAndClearLaunches(workspace.Tabs.SelectMany(tab => tab.RootPane.Terminals()
+            .Select(leaf => (workspace.Id, tab, leaf))));
+        foreach (var item in pending) _closingSessions.Add(item.SessionId);
+        if (!CommitLayout("workspace-close-intent", force: true))
         {
-            var state = _tabs[tab.Id];
-            foreach (var pane in state.Panes.Values) ClosePaneConnection(pane, false);
+            foreach (var item in pending) _closingSessions.Remove(item.SessionId);
+            RestoreLaunches(pending);
+            MarkLayoutDirty();
+            throw new InvalidOperationException("Layout could not record the close intent; workspace was kept.");
+        }
+        if (states.SelectMany(state => state.Panes.Values).Any(pane => !ClosePaneConnection(pane, false)))
+            throw new InvalidOperationException("One or more terminals could not be closed; the workspace was kept for retry.");
+        foreach (var state in states)
+        {
             TerminalHost.Children.Remove(state.View);
-            _tabs.Remove(tab.Id);
+            _tabs.Remove(state.Tab.Id);
         }
         _workspaces.Delete(workspace.Id);
-    });
+        App.Diagnostics.Write(DiagnosticLevel.Info, "workspace.deleted", $"workspaceId={workspace.Id}");
+    }, immediate: true);
     private void OnPinWorkspaceClicked(object sender, RoutedEventArgs e) => ChangeWorkspace(() => _workspaces.TogglePin(SelectedWorkspace.Id));
     private void OnMoveWorkspaceUpClicked(object sender, RoutedEventArgs e) => ChangeWorkspace(() => _workspaces.Move(SelectedWorkspace.Id, -1));
     private void OnMoveWorkspaceDownClicked(object sender, RoutedEventArgs e) => ChangeWorkspace(() => _workspaces.Move(SelectedWorkspace.Id, 1));
 
-    private void ChangeWorkspace(Action action)
+    private void ChangeWorkspace(Action action, bool immediate = false)
     {
-        try { action(); RefreshWorkspaces(); MarkLayoutDirty(); }
-        catch (Exception ex) { WorkspaceMessage.Foreground = System.Windows.Media.Brushes.LightCoral; WorkspaceMessage.Text = ex.Message; }
+        try
+        {
+            action();
+            RefreshWorkspaces();
+            if (immediate) CommitLayout("workspace");
+            else MarkLayoutDirty();
+        }
+        catch (Exception ex)
+        {
+            WorkspaceMessage.Foreground = System.Windows.Media.Brushes.LightCoral;
+            WorkspaceMessage.Text = ex.Message;
+        }
     }
 
     private void RefreshWorkspaces()
@@ -589,31 +703,59 @@ public partial class MainWindow : Window
 
     private void RefreshWorkspaceSidebar()
     {
-        var items = _workspaces.Workspaces.Select(workspace =>
-        {
-            var running = new List<PaneState>();
-            foreach (var tab in workspace.Tabs)
-            {
-                if (!_tabs.TryGetValue(tab.Id, out var tabState)) continue;
-                foreach (var leaf in tab.RootPane.Terminals())
-                    if (leaf.SessionId is { } id && tabState.Panes.TryGetValue(id, out var pane))
-                        running.Add(pane);
-            }
-            var details = running.Select(p => new SidebarTerminalItem(
-                $"Terminal {p.Number}  { (p.Detection.Type == AgentType.Unknown ? p.LastProfileName ?? "" : p.Detection.Type.ToString())}",
-                StatusBrush(p), StatusDescription(p))).ToArray();
-            var branch = _gitContexts.TryGetValue(workspace.Id, out var git) && git is not null
-                ? $"⑂  {git.Branch}{(git.IsDirty ? " *" : "")}" : null;
-            return new SidebarItem(workspace, $"{(workspace.IsPinned ? "📌 " : "")}{workspace.Name}", branch, details);
-        }).ToArray();
-        var signature = string.Join("|", items.Select(i =>
-            $"{i.Workspace.Id}:{i.Name}:{i.Branch}:{string.Join(',', i.Terminals.Select(t => t.Name + t.StatusText))}")) + _workspaces.ActiveId;
+        var signature = BuildSidebarSignature();
         if (signature == _sidebarSignature) return;
         _sidebarSignature = signature;
+        var items = _workspaces.Workspaces.Select(workspace =>
+        {
+            var groups = workspace.Tabs.Select(tab =>
+            {
+                var terminals = _tabs.TryGetValue(tab.Id, out var tabState)
+                    ? tab.RootPane.Terminals()
+                        .Select(leaf => leaf.SessionId is { } id && tabState.Panes.TryGetValue(id, out var pane) ? pane : null)
+                        .OfType<PaneState>()
+                        .Select(p => new SidebarTerminalItem(
+                            $"Terminal {p.Number}  {(p.Detection.Type == AgentType.Unknown ? p.LastProfileName ?? "" : p.Detection.Type.ToString())}",
+                            StatusBrush(p), StatusDescription(p))).ToArray()
+                    : [];
+                return new SidebarGroupItem(tab.Title, terminals);
+            }).ToArray();
+            var branch = _gitContexts.TryGetValue(workspace.Id, out var git) && git is not null
+                ? $"⑂  {git.Branch}{(git.IsDirty ? " *" : "")}" : null;
+            return new SidebarItem(workspace, $"{(workspace.IsPinned ? "📌 " : "")}{workspace.Name}", branch, groups);
+        }).ToArray();
         _refreshingWorkspaces = true;
         WorkspaceList.ItemsSource = items;
         WorkspaceList.SelectedItem = items.FirstOrDefault(i => i.Workspace.Id == _workspaces.ActiveId);
         _refreshingWorkspaces = false;
+    }
+
+    private string BuildSidebarSignature()
+    {
+        var builder = new StringBuilder();
+        builder.Append(_workspaces.ActiveId);
+        foreach (var workspace in _workspaces.Workspaces)
+        {
+            builder.Append('|').Append(workspace.Id).Append(':').Append(workspace.IsPinned)
+                .Append(':').Append(workspace.Name);
+            var branch = _gitContexts.TryGetValue(workspace.Id, out var git) && git is not null
+                ? $"{git.Branch}*{git.IsDirty}" : "-";
+            builder.Append(':').Append(branch);
+            foreach (var tab in workspace.Tabs)
+            {
+                builder.Append('|').Append(tab.Id).Append(':').Append(tab.Title);
+                if (!_tabs.TryGetValue(tab.Id, out var tabState)) continue;
+                foreach (var leaf in tab.RootPane.Terminals())
+                {
+                    if (leaf.SessionId is not { } id || !tabState.Panes.TryGetValue(id, out var pane)) continue;
+                    builder.Append(';').Append(pane.Number).Append(':').Append(pane.Detection.Type)
+                        .Append(':').Append(pane.Status).Append(':').Append(pane.CompletionRead)
+                        .Append(':').Append(pane.Connection is not null).Append(':').Append(pane.LastProfileName)
+                        .Append(':').Append(HasRecentOutput(pane));
+                }
+            }
+        }
+        return builder.ToString();
     }
 
     private static bool HasRecentOutput(PaneState pane) => pane.Connection is { LastOutputTick: > 0 } connection &&
@@ -636,7 +778,15 @@ public partial class MainWindow : Window
         AgentStatus.Waiting or AgentStatus.Completed when !pane.CompletionRead => "Finished, unread",
         AgentStatus.Waiting or AgentStatus.Completed => "Finished, read",
         AgentStatus.Error => "Error",
-        _ => "No task status",
+        _ => pane.Detection.Type == AgentType.Unknown ? "No agent detected" : "Agent has not reported task status",
+    };
+
+    private static string ActivityLabel(PaneState pane) => pane.Detection.Type switch
+    {
+        AgentType.Unknown when pane.Status == AgentStatus.Unknown => "No agent detected",
+        AgentType.Unknown => $"Agent: {pane.Status}",
+        _ when pane.Status == AgentStatus.Unknown => $"{pane.Detection.Type}: status not reported",
+        _ => $"{pane.Detection.Type}: {pane.Status}",
     };
 
     private void CreateTab(Workspace workspace)
@@ -645,6 +795,7 @@ public partial class MainWindow : Window
         while (workspace.Tabs.Any(tab => tab.Title.Equals($"Group {number}", StringComparison.OrdinalIgnoreCase))) number++;
         var tab = _workspaces.CreateTab(workspace.Id, $"Group {number}");
         AttachTab(workspace, tab);
+        App.Diagnostics.Write(DiagnosticLevel.Info, "group.created", $"workspaceId={workspace.Id} groupId={tab.Id}");
         MarkLayoutDirty();
     }
 
@@ -668,12 +819,24 @@ public partial class MainWindow : Window
     {
         if (_activeTab is null) return;
         var state = _activeTab;
-        foreach (var pane in state.Panes.Values) ClosePaneConnection(pane, false);
+        var pending = CaptureAndClearLaunches(state.Tab.RootPane.Terminals()
+            .Select(leaf => (state.WorkspaceId, state.Tab, leaf)));
+        foreach (var item in pending) _closingSessions.Add(item.SessionId);
+        if (!CommitLayout("group-close-intent", force: true))
+        {
+            foreach (var item in pending) _closingSessions.Remove(item.SessionId);
+            RestoreLaunches(pending);
+            MarkLayoutDirty();
+            throw new InvalidOperationException("Layout could not record the close intent; group was kept.");
+        }
+        if (state.Panes.Values.Any(pane => !ClosePaneConnection(pane, false)))
+            throw new InvalidOperationException("One or more terminals could not be closed; the group was kept for retry.");
         TerminalHost.Children.Remove(state.View);
         _tabs.Remove(state.Tab.Id);
         _workspaces.CloseTab(SelectedWorkspace.Id, state.Tab.Id);
+        App.Diagnostics.Write(DiagnosticLevel.Info, "group.closed", $"workspaceId={state.WorkspaceId} groupId={state.Tab.Id}");
         RefreshTabs();
-    });
+    }, immediate: true);
 
     private void OnCloseTabItemClicked(object sender, RoutedEventArgs e)
     {
@@ -708,6 +871,7 @@ public partial class MainWindow : Window
             GroupRenamePopup.IsOpen = false;
             _renamingTab = null;
             RefreshTabs();
+            RefreshWorkspaceSidebar();
             MarkLayoutDirty();
         }
         catch (Exception ex) { GroupRenameError.Text = ex.Message; }
@@ -760,51 +924,147 @@ public partial class MainWindow : Window
         CloseButton.IsEnabled = running;
         KillButton.IsEnabled = running;
         FocusButton.IsEnabled = running;
-        Title = _activeTab is null ? "cmux — No tab" : $"cmux — {_lastProfileName ?? _activeTab.Tab.Title}";
-        if (running) UpdateStatus();
+        Title = _activeTab is null ? "WinPaneDock — No tab" : $"WinPaneDock — {_lastProfileName ?? _activeTab.Tab.Title}";
+        if (running) QueueStatusUpdate();
         else StatusText.Text = _activeTab is null ? "Create a group to start a terminal." : "Terminal closed. Use Start to reopen this pane.";
     }
 
     private void MarkLayoutDirty()
     {
-        if (!_saveEnabled || _restoring) return;
+        if (!_smoke.AllowsLayoutPersistence || _restoring || _layoutSaveBlocked) return;
         _saveTimer.Stop();
         _saveTimer.Start();
     }
 
-    private void SaveLayout()
+    private bool SaveLayout(bool force = false)
     {
         _saveTimer.Stop();
-        if (!_saveEnabled || _restoring) return;
-        try { _layoutStore.Save(_workspaces.Export()); }
-        catch (Exception ex) { App.Log($"Layout save failed: {ex}"); }
+        if (!_smoke.AllowsLayoutPersistence || (_restoring && !force)) return true;
+        if (_layoutSaveBlocked)
+        {
+            ShowLayoutSaveError(_lastSaveError ?? "Layout persistence is disabled until the invalid files are repaired.");
+            return false;
+        }
+        try
+        {
+            _layoutStore.Save(_workspaces.Export());
+            _lastSaveError = null;
+            App.Diagnostics.Write(DiagnosticLevel.Debug, "layout.saved", $"workspaces={_workspaces.Workspaces.Count}");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _lastSaveError = ex.Message;
+            ShowLayoutSaveError($"LAYOUT SAVE FAILED: {ex.Message}");
+            App.Log($"Layout save failed: {ex}");
+            return false;
+        }
+    }
+
+    private bool CommitLayout(string operation, bool force = false)
+    {
+        var saved = SaveLayout(force);
+        App.Diagnostics.Write(DiagnosticLevel.Info, "layout.commit",
+            $"operation={operation} saved={saved} workspaces={_workspaces.Workspaces.Count}");
+        return saved;
+    }
+
+    private void ShowLayoutSaveError(string message)
+    {
+        if (StatusText is not null) StatusText.Text = message;
+        if (WorkspaceMessage is not null)
+        {
+            WorkspaceMessage.Foreground = System.Windows.Media.Brushes.LightCoral;
+            WorkspaceMessage.Text = message;
+        }
+    }
+
+    private static LaunchState CaptureLaunch(PaneNode leaf) =>
+        new(leaf.ProfileName, leaf.CommandLine, leaf.WorkingDirectory, leaf.Title);
+
+    private List<PendingLaunchClear> CaptureAndClearLaunches(IEnumerable<(Guid WorkspaceId, TerminalTab Tab, PaneNode Leaf)> leaves)
+    {
+        var pending = new List<PendingLaunchClear>();
+        foreach (var item in leaves)
+        {
+            pending.Add(new PendingLaunchClear(item.WorkspaceId, item.Tab.Id, item.Leaf.SessionId!.Value,
+                CaptureLaunch(item.Leaf)));
+            _workspaces.ClearTerminalLaunch(item.WorkspaceId, item.Tab.Id, item.Leaf.SessionId!.Value);
+        }
+        return pending;
+    }
+
+    private void RestoreLaunches(IEnumerable<PendingLaunchClear> pending)
+    {
+        foreach (var item in pending)
+            _workspaces.SetTerminalLaunch(item.WorkspaceId, item.TabId, item.SessionId,
+                item.State.ProfileName, item.State.CommandLine, item.State.WorkingDirectory, item.State.Title);
+    }
+
+    private async Task CleanupExplicitCloseSessionsAsync()
+    {
+        var emptyLaunches = _workspaces.Workspaces.SelectMany(workspace => workspace.Tabs)
+            .SelectMany(tab => tab.RootPane.Terminals())
+            .Where(leaf => string.IsNullOrWhiteSpace(leaf.CommandLine) && leaf.SessionId is not null)
+            .Select(leaf => leaf.SessionId!.Value)
+            .ToHashSet();
+        if (emptyLaunches.Count == 0) return;
+        try
+        {
+            var response = await SessionHostClient.SendAsync(new HostRequest("list"), 500).ConfigureAwait(false);
+            SessionHostClient.RequireCompatibleIdentity(response,
+                Path.Combine(AppContext.BaseDirectory, "Cmux.SessionHost.exe"));
+            foreach (var session in response.Sessions ?? [])
+            {
+                if (!Guid.TryParse(session.SessionId, out var sessionId) || !emptyLaunches.Contains(sessionId)) continue;
+                await SessionHostClient.SendAsync(new HostRequest("close", session.SessionId,
+                    LeaseId: session.LeaseId)).ConfigureAwait(false);
+                App.Diagnostics.Write(DiagnosticLevel.Info, "orphan.closed",
+                    $"sessionId={session.SessionId} processId={session.ProcessId}");
+            }
+        }
+        catch (Exception ex)
+        {
+            App.Log($"Explicit-close reconciliation failed: {ex}");
+        }
     }
 
     private async Task RestoreShellsAsync()
     {
         var target = _focus.Current;
+        App.Diagnostics.Write(DiagnosticLevel.Info, "restore.start", $"workspaces={_workspaces.Workspaces.Count}");
+        await CleanupExplicitCloseSessionsAsync().ConfigureAwait(true);
         try
         {
             foreach (var workspace in _workspaces.Workspaces)
             {
+                App.Diagnostics.Write(DiagnosticLevel.Debug, "restore.workspace.begin", $"workspaceId={workspace.Id}");
                 _focus.FocusWorkspace(workspace.Id);
+                App.Diagnostics.Write(DiagnosticLevel.Debug, "restore.workspace.focused", $"workspaceId={workspace.Id}");
                 RefreshWorkspaces();
+                App.Diagnostics.Write(DiagnosticLevel.Debug, "restore.workspace.refreshed", $"workspaceId={workspace.Id}");
                 foreach (var tab in workspace.Tabs)
                 {
                     _focus.FocusTab(workspace.Id, tab.Id);
                     RefreshTabs();
-                    await Dispatcher.Yield(DispatcherPriority.Loaded);
+                    App.Diagnostics.Write(DiagnosticLevel.Debug, "restore.tab.ready", $"tabId={tab.Id}");
+                    await Task.Delay(1);
+                    App.Diagnostics.Write(DiagnosticLevel.Debug, "restore.tab.resumed", $"tabId={tab.Id}");
                     foreach (var leaf in tab.RootPane.Terminals())
                     {
                         if (string.IsNullOrWhiteSpace(leaf.CommandLine)) continue;
                         var state = _tabs[tab.Id];
                         FocusPane(state, leaf.SessionId!.Value, true);
-                        await Dispatcher.Yield(DispatcherPriority.Loaded);
+                        App.Diagnostics.Write(DiagnosticLevel.Debug, "restore.pane.focused", $"sessionId={leaf.SessionId}");
+                        await Task.Delay(1);
+                        App.Diagnostics.Write(DiagnosticLevel.Debug, "restore.pane.resumed", $"sessionId={leaf.SessionId}");
                         try
                         {
                             var directory = Directory.Exists(leaf.WorkingDirectory) ? leaf.WorkingDirectory
                                 : Directory.Exists(workspace.RootDirectory) ? workspace.RootDirectory : Environment.CurrentDirectory;
-                            StartTerminal(leaf.CommandLine, directory, leaf.ProfileName);
+                            App.Diagnostics.Write(DiagnosticLevel.Debug, "restore.terminal.start",
+                                $"sessionId={leaf.SessionId} command={leaf.ProfileName}");
+                            await StartTerminalAsync(leaf.CommandLine, directory, leaf.ProfileName);
                         }
                         catch (Exception ex)
                         {
@@ -817,15 +1077,29 @@ public partial class MainWindow : Window
         }
         finally
         {
-            if (target.WorkspaceId is { } workspaceId && _workspaces.Workspaces.Any(w => w.Id == workspaceId))
+            // Focus restoration is best effort: the focused group/pane may have been closed
+            // while restore was still starting shells. It must never keep _restoring set,
+            // because MarkLayoutDirty is a no-op for the rest of the session while it is.
+            try
             {
-                _focus.FocusWorkspace(workspaceId);
-                if (target.TabId is { } tabId) _focus.FocusTab(workspaceId, tabId);
-                if (target.PaneId is { } paneId && target.TabId is { } focusedTabId)
-                    _focus.FocusPane(workspaceId, focusedTabId, paneId);
+                if (target.WorkspaceId is { } workspaceId && _workspaces.Workspaces.Any(w => w.Id == workspaceId))
+                {
+                    _focus.FocusWorkspace(workspaceId);
+                    if (target.TabId is { } tabId) _focus.FocusTab(workspaceId, tabId);
+                    if (target.PaneId is { } paneId && target.TabId is { } focusedTabId)
+                        _focus.FocusPane(workspaceId, focusedTabId, paneId);
+                }
+                RefreshWorkspaces();
             }
-            RefreshWorkspaces();
-            _restoring = false;
+            catch (Exception ex)
+            {
+                App.Log($"Restore focus fallback failed: {ex}");
+            }
+            finally
+            {
+                _restoring = false;
+            }
+            App.Diagnostics.Write(DiagnosticLevel.Info, "restore.complete", $"workspaces={_workspaces.Workspaces.Count}");
             MarkLayoutDirty();
         }
     }
@@ -852,6 +1126,16 @@ public partial class MainWindow : Window
                 scrollBar.Style = scrollStyle;
                 scrollBar.Width = 10;
             }
+            // TerminalContainer throws away output that arrives before its native window
+            // exists, and a TUI will not repaint itself afterwards. Replay the buffered tail
+            // once the control is realised, posted so the layout pass that builds the native
+            // terminal has completed.
+            if (pane.NeedsOutputReplay)
+            {
+                pane.NeedsOutputReplay = false;
+                Dispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.ApplicationIdle,
+                    new Action(() => pane.Connection?.ReplayBufferedOutput()));
+            }
         };
         pane.Header.SetResourceReference(DockPanel.BackgroundProperty, "UiPanel");
         pane.Label.SetResourceReference(TextBlock.ForegroundProperty, "UiMuted");
@@ -873,13 +1157,20 @@ public partial class MainWindow : Window
         if (leaf is null) return;
         _focus.FocusTerminal(tab.WorkspaceId, tab.Tab.Id, sessionId);
         _activePane = tab.Panes[sessionId];
+        if (_activePane.Connection is { IsPrepared: true } prepared && !_activePane.ControlAttached)
+        {
+            AttachControlConnection(_activePane, prepared);
+            // A pane attached lazily through focus never went through Boot(), so it still
+            // needs the configured padding, theme and font.
+            ApplyTerminalAppearance(_activePane);
+        }
         if (_activePane.Status is AgentStatus.Waiting or AgentStatus.Completed &&
             (focusControl || IsActive && _activePane.Control.IsKeyboardFocusWithin))
             _activePane.CompletionRead = true;
         UpdatePaneLabel(_activePane);
         UpdatePaneBorders();
         if (focusControl) _activePane.Control.Focus();
-        UpdateStatus();
+        QueueStatusUpdate();
         MarkLayoutDirty();
     }
 
@@ -931,11 +1222,24 @@ public partial class MainWindow : Window
         var tab = _activeTab;
         var pane = _activePane;
         var leaf = tab.Tab.RootPane.Terminals().First(p => p.Id == tab.Tab.ActivePaneId);
-        ClosePaneConnection(pane, false);
+        var sessionId = leaf.SessionId!.Value;
+        _closingSessions.Add(sessionId);
+        var pending = CaptureAndClearLaunches([(tab.WorkspaceId, tab.Tab, leaf)]);
+        if (!CommitLayout("pane-close-intent", force: true))
+        {
+            _closingSessions.Remove(sessionId);
+            RestoreLaunches(pending);
+            MarkLayoutDirty();
+            return;
+        }
+        if (!ClosePaneConnection(pane, false))
+        {
+            StatusText.Text = "Terminal close failed; the pane was kept so you can retry.";
+            return;
+        }
         if (!_workspaces.ClosePane(tab.WorkspaceId, tab.Tab.Id, leaf.Id)) return;
         tab.View.Children.Remove(pane.Frame);
         tab.Panes.Remove(leaf.SessionId!.Value);
-        MarkLayoutDirty();
         ShowTab(tab.Tab.Id);
         RenderPaneLayout(tab);
     }
@@ -1037,310 +1341,12 @@ public partial class MainWindow : Window
         }
     }
 
-    private async Task RunLifecycleSmokeAsync()
-    {
-        var initialHandles = Process.GetCurrentProcess().HandleCount;
-        var failures = new List<string>();
-        for (var i = 0; i < _lifecycleSmokeCycles; i++)
-        {
-            try
-            {
-                StartTerminal("cmd.exe", Environment.CurrentDirectory, "CMD");
-                Terminal.TriggerResize(new Size(Math.Max(200, Terminal.ActualWidth - i % 2 * 30),
-                    Math.Max(120, Terminal.ActualHeight - i % 2 * 20)));
-                Terminal.Focus();
-                await Task.Delay(50);
-                if (i % 10 == 4)
-                {
-                    var oldPid = _connection!.ProcessId;
-                    OnRestartClicked(this, new RoutedEventArgs());
-                    if (_connection?.ProcessId == oldPid) failures.Add($"cycle {i + 1}: restart retained shell {oldPid}");
-                }
-                var pid = _connection!.ProcessId;
-                CloseTerminal(i % 10 == 9);
-                try { using var shell = Process.GetProcessById(pid); if (!shell.HasExited) failures.Add($"cycle {i + 1}: shell {pid} alive"); }
-                catch (ArgumentException) { }
-            }
-            catch (Exception ex)
-            {
-                failures.Add($"cycle {i + 1}: {ex.Message}");
-                try { CloseTerminal(true); } catch { }
-                break;
-            }
-        }
-
-        GC.Collect();
-        GC.WaitForPendingFinalizers();
-        var finalHandles = Process.GetCurrentProcess().HandleCount;
-        var result = $"cycles={_lifecycleSmokeCycles}; initialHandles={initialHandles}; finalHandles={finalHandles}; failures={failures.Count}{Environment.NewLine}" +
-            string.Join(Environment.NewLine, failures);
-        File.WriteAllText(Path.Combine(AppContext.BaseDirectory, "m1-lifecycle-smoke.log"), result);
-        System.Windows.Application.Current.Shutdown(failures.Count == 0 ? 0 : 1);
-    }
-
-    private async Task RunTabSmokeAsync()
-    {
-        var failures = new List<string>();
-        try
-        {
-            var firstWorkspace = _workspaces.Active!;
-            StartTerminal("cmd.exe /k echo TAB-ONE", firstWorkspace.RootDirectory, "CMD");
-            await Task.Delay(150);
-            var firstTab = _activeTab!;
-            var firstPid = _connection!.ProcessId;
-
-            CreateTab(firstWorkspace);
-            RefreshTabs();
-            await Task.Delay(100);
-            StartTerminal("cmd.exe /k echo TAB-TWO", firstWorkspace.RootDirectory, "CMD");
-            var secondPid = _connection!.ProcessId;
-
-            _focus.FocusTab(firstWorkspace.Id, firstTab.Tab.Id);
-            RefreshTabs();
-            await Task.Delay(100);
-            var secondWorkspace = _workspaces.Create("Other", Environment.CurrentDirectory);
-            CreateTab(secondWorkspace);
-            RefreshWorkspaces();
-            await Task.Delay(100);
-            StartTerminal("cmd.exe /k echo WORKSPACE-TWO", secondWorkspace.RootDirectory, "CMD");
-            var thirdPid = _connection!.ProcessId;
-
-            _focus.FocusWorkspace(firstWorkspace.Id);
-            RefreshWorkspaces();
-            await Task.Delay(100);
-            if (_activeTab != firstTab || firstTab.View.Visibility != Visibility.Visible)
-                failures.Add("First tab was not restored.");
-            foreach (var pid in new[] { firstPid, secondPid, thirdPid })
-            {
-                try { using var process = Process.GetProcessById(pid); if (process.HasExited) failures.Add($"Shell {pid} exited."); }
-                catch (ArgumentException) { failures.Add($"Shell {pid} disappeared."); }
-            }
-        }
-        catch (Exception ex) { failures.Add(ex.ToString()); }
-
-        File.WriteAllText(Path.Combine(AppContext.BaseDirectory, "m2-tab-smoke.log"),
-            $"failures={failures.Count}{Environment.NewLine}" + string.Join(Environment.NewLine, failures));
-        await Task.Delay(5000); // allow visual capture after switching back to the first tab
-        foreach (var state in _tabs.Values)
-            foreach (var pane in state.Panes.Values) ClosePaneConnection(pane, false);
-        System.Windows.Application.Current.Shutdown(failures.Count == 0 ? 0 : 1);
-    }
-
-    private async Task RunPaneSmokeAsync()
-    {
-        var failures = new List<string>();
-        try
-        {
-            StartTerminal("cmd.exe /k echo PANE-ONE", Environment.CurrentDirectory, "CMD");
-            await Task.Delay(100);
-            SplitActivePane(PaneOrientation.Right);
-            await Task.Delay(100);
-            SplitActivePane(PaneOrientation.Down);
-            await Task.Delay(100);
-            var tab = _activeTab!;
-            var leaves = tab.Tab.RootPane.Terminals().ToArray();
-            if (leaves.Length != 3 || tab.Panes.Count != 3) failures.Add("Three panes were not created.");
-            _workspaces.ResizePane(tab.WorkspaceId, tab.Tab.Id, tab.Tab.RootPane.Id, 0.6);
-            RenderPaneLayout(tab);
-            FocusPane(tab, leaves[0].SessionId!.Value, true);
-            FocusPaneInDirection(1, 0);
-            if (_activePane == tab.Panes[leaves[0].SessionId!.Value]) failures.Add("Directional pane focus failed.");
-            FocusPane(tab, leaves[0].SessionId!.Value, true);
-            foreach (var pane in tab.Panes.Values)
-                if (pane.Connection is null || pane.Connection.ProcessId == 0) failures.Add("A pane has no shell.");
-        }
-        catch (Exception ex) { failures.Add(ex.ToString()); }
-
-        await Task.Delay(5000);
-        if (_activeTab is { } current && _activePane is { Connection: { } closing })
-        {
-            var closingPid = closing.ProcessId;
-            OnClosePaneClicked(this, new RoutedEventArgs());
-            if (current.Tab.RootPane.Terminals().Count() != 2) failures.Add("Close Pane did not leave two panes.");
-            try { using var shell = Process.GetProcessById(closingPid); if (!shell.HasExited) failures.Add("Closed pane shell is alive."); }
-            catch (ArgumentException) { }
-        }
-        if (_activeTab is { } active)
-            foreach (var pane in active.Panes.Values) ClosePaneConnection(pane, false);
-        File.WriteAllText(Path.Combine(AppContext.BaseDirectory, "m2-pane-smoke.log"),
-            $"failures={failures.Count}{Environment.NewLine}" + string.Join(Environment.NewLine, failures));
-        System.Windows.Application.Current.Shutdown(failures.Count == 0 ? 0 : 1);
-    }
-
-    private async Task RunM2GateSmokeAsync()
-    {
-        var failures = new List<string>();
-        var pids = new List<int>();
-        var detections = new List<string>();
-        try
-        {
-            var workspace = _workspaces.Active!;
-            var tab = _activeTab!;
-            var right = _workspaces.SplitPane(workspace.Id, tab.Tab.Id, tab.Tab.RootPane.Id, PaneOrientation.Right);
-            AddPane(tab, right.SessionId!.Value);
-            var lowerLeft = _workspaces.SplitPane(workspace.Id, tab.Tab.Id, tab.Tab.RootPane.ChildA!.Id, PaneOrientation.Down);
-            AddPane(tab, lowerLeft.SessionId!.Value);
-            var lowerRight = _workspaces.SplitPane(workspace.Id, tab.Tab.Id, right.Id, PaneOrientation.Down);
-            AddPane(tab, lowerRight.SessionId!.Value);
-            ShowTab(tab.Tab.Id);
-            RenderPaneLayout(tab);
-            tab.View.UpdateLayout();
-            await Task.Delay(100);
-
-            var pwsh = ((IReadOnlyList<TerminalProfile>)ProfilePicker.ItemsSource)
-                .First(p => p.Name == "PowerShell 7").CommandLine;
-            var commands = new[]
-            {
-                (Command: $"{pwsh} -NoProfile -NoExit -Command codex", Name: "Codex"),
-                (Command: $"{pwsh} -NoProfile -NoExit", Name: "PowerShell"),
-                (Command: $"{pwsh} -NoProfile -NoExit -Command claude", Name: "Claude"),
-                (Command: "python.exe -m http.server 18765 --bind 127.0.0.1", Name: "Dev Server"),
-            };
-            var leaves = tab.Tab.RootPane.Terminals().ToArray();
-            for (var i = 0; i < leaves.Length; i++)
-            {
-                FocusPane(tab, leaves[i].SessionId!.Value, true);
-                StartTerminal(commands[i].Command, workspace.RootDirectory, commands[i].Name);
-                pids.Add(_connection!.ProcessId);
-                await Task.Delay(100);
-            }
-            FocusPane(tab, leaves[0].SessionId!.Value, true);
-            FocusPaneInDirection(1, 0);
-            FocusPane(tab, leaves[0].SessionId!.Value, true);
-            await Task.Delay(2500);
-            foreach (var pid in pids)
-            {
-                try { using var process = Process.GetProcessById(pid); if (process.HasExited) failures.Add($"Process {pid} exited."); }
-                catch (ArgumentException) { failures.Add($"Process {pid} disappeared."); }
-            }
-            var snapshot = AgentDetector.Scan();
-            for (var i = 0; i < leaves.Length; i++)
-            {
-                var pane = tab.Panes[leaves[i].SessionId!.Value];
-                var detection = AgentDetector.Detect(pane.Connection!.ProcessId, snapshot,
-                    pane.Connection.CommandLine, pane.LastProfileName ?? "");
-                detections.Add($"{commands[i].Name}:{detection.Type}/{detection.Source}");
-                if (i == 0 && detection.Type != AgentType.Codex) failures.Add("Codex was not detected.");
-                if (i == 2 && detection.Type != AgentType.Claude) failures.Add("Claude was not detected.");
-            }
-        }
-        catch (Exception ex) { failures.Add(ex.ToString()); }
-
-        File.WriteAllText(Path.Combine(AppContext.BaseDirectory, "m2-gate-smoke.log"),
-            $"pids={string.Join(',', pids)}; detections={string.Join(',', detections)}; failures={failures.Count}{Environment.NewLine}" +
-            string.Join(Environment.NewLine, failures));
-        await Task.Delay(5000);
-        foreach (var tab in _tabs.Values)
-            foreach (var pane in tab.Panes.Values) ClosePaneConnection(pane, false);
-        System.Windows.Application.Current.Shutdown(failures.Count == 0 ? 0 : 1);
-    }
-
-    private async Task RunEventSmokeAsync()
-    {
-        var failure = "";
-        try
-        {
-            var reportedDirectory = Path.GetTempPath().TrimEnd(Path.DirectorySeparatorChar);
-            StartTerminal($"cmd.exe /k cmux notify working && cmux notify waiting && cmux cwd \"{reportedDirectory}\"",
-                Environment.CurrentDirectory, "CMD");
-            await Task.Delay(1500);
-            if (_activePane?.Status != AgentStatus.Waiting)
-                failure = $"Expected Waiting, got {_activePane?.Status}.";
-            if (_activePane?.CurrentDirectory != reportedDirectory)
-                failure = $"Expected cwd {reportedDirectory}, got {_activePane?.CurrentDirectory}.";
-            if (HandleAgentEvent(new AgentEvent(Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), AgentStatus.Error)))
-                failure = "Unknown session event was accepted.";
-            if (_activePane?.Status != AgentStatus.Waiting)
-                failure = "Unknown session changed the active pane.";
-        }
-        catch (Exception ex) { failure = ex.ToString(); }
-        File.WriteAllText(Path.Combine(AppContext.BaseDirectory, "m4-event-smoke.log"),
-            failure.Length == 0 ? "working -> waiting: PASS" : failure);
-        await Task.Delay(3000);
-        CloseTerminal(false);
-        System.Windows.Application.Current.Shutdown(failure.Length == 0 ? 0 : 1);
-    }
-
-    private async Task RunNotificationSmokeAsync()
-    {
-        var failure = "";
-        try
-        {
-            StartTerminal("cmd.exe", Environment.CurrentDirectory, "CMD");
-            var tab = _activeTab!;
-            var first = tab.Tab.RootPane.Terminals().First();
-            SplitActivePane(PaneOrientation.Right);
-            await Task.Delay(100);
-            var working = new AgentEvent(tab.WorkspaceId, first.Id, first.SessionId!.Value, AgentStatus.Working);
-            HandleAgentEvent(working);
-            HandleAgentEvent(working with { Status = AgentStatus.Waiting });
-            if (_waitingNotificationCount != 1 || _pendingNotification is null)
-                failure = "Background Working -> Waiting did not notify.";
-            NavigateToPendingNotification();
-            if (_focus.Current.PaneId != first.Id || _pendingNotification is not null)
-                failure = "Notification click did not focus the original pane.";
-        }
-        catch (Exception ex) { failure = ex.ToString(); }
-        File.WriteAllText(Path.Combine(AppContext.BaseDirectory, "m4-notification-smoke.log"),
-            failure.Length == 0 ? "background waiting notification and click navigation: PASS" : failure);
-        foreach (var tab in _tabs.Values)
-            foreach (var pane in tab.Panes.Values) ClosePaneConnection(pane, false);
-        System.Windows.Application.Current.Shutdown(failure.Length == 0 ? 0 : 1);
-    }
-
-    private async Task RunCwdSmokeAsync()
-    {
-        var failure = "";
-        try
-        {
-            var profile = ((IReadOnlyList<TerminalProfile>)ProfilePicker.ItemsSource)
-                .First(p => p.Name == "PowerShell 7");
-            StartProfile(profile);
-            if (_connection is null) throw new InvalidOperationException("PowerShell did not start.");
-            var directory = Path.GetTempPath().TrimEnd(Path.DirectorySeparatorChar);
-            _connection.WriteInput($"Set-Location -LiteralPath '{directory.Replace("'", "''")}'\r");
-            await Task.Delay(1800);
-            if (_activePane?.CurrentDirectory != directory)
-                failure = $"Expected cwd {directory}, got {_activePane?.CurrentDirectory}.";
-        }
-        catch (Exception ex) { failure = ex.ToString(); }
-        File.WriteAllText(Path.Combine(AppContext.BaseDirectory, "m7-cwd-smoke.log"),
-            failure.Length == 0 ? "PowerShell prompt cwd update: PASS" : failure);
-        CloseTerminal(false);
-        System.Windows.Application.Current.Shutdown(failure.Length == 0 ? 0 : 1);
-    }
-
-    private async Task RunPaletteSmokeAsync()
-    {
-        var failure = "";
-        try
-        {
-            OpenPalette();
-            PaletteQuery.Text = "Split Right";
-            ExecuteSelectedPaletteCommand();
-            if (_activeTab?.Tab.RootPane.Terminals().Count() != 2)
-                failure = "Split Right did not create a second Pane.";
-            OpenPalette();
-            PaletteQuery.Text = "Close Terminal";
-            ExecuteSelectedPaletteCommand();
-            if (_activeTab?.Tab.RootPane.Terminals().Count() != 1)
-                failure = "Close Pane did not remove the second Pane.";
-            if (PalettePopup.IsOpen)
-                failure = "Palette remained visible after command.";
-        }
-        catch (Exception ex) { failure = ex.ToString(); }
-        File.WriteAllText(Path.Combine(AppContext.BaseDirectory, "m8-palette-smoke.log"),
-            failure.Length == 0 ? "palette split/close pane: PASS" : failure);
-        await Task.Delay(100);
-        System.Windows.Application.Current.Shutdown(failure.Length == 0 ? 0 : 1);
-    }
-
     private void StartProfile(TerminalProfile profile, string? inheritedDirectory = null)
     {
         try
         {
             if (string.IsNullOrWhiteSpace(profile.Command))
-                throw new InvalidDataException($"{profile.Name}: set command in {ProfileStore.FilePath}, then reopen cmux.");
+                throw new InvalidDataException($"{profile.Name}: set command in {ProfileStore.FilePath}, then reopen WinPaneDock.");
             var directory = string.IsNullOrWhiteSpace(profile.StartingDirectory)
                 ? inheritedDirectory ?? _workspaces.Active?.RootDirectory ?? Environment.CurrentDirectory
                 : profile.WorkingDirectory;
@@ -1367,52 +1373,125 @@ public partial class MainWindow : Window
 
     private void StartTerminal(string commandLine, string workingDirectory, string profileName)
     {
-        if (_connection is not null) return;
-        var pane = _activeTab!.Tab.RootPane.Terminals().First(p => p.Id == _activeTab.Tab.ActivePaneId);
+        if (_activeTab is not null && _activePane is not null)
+        {
+            var sessionId = _activeTab.Tab.RootPane.Terminals()
+                .First(p => p.Id == _activeTab.Tab.ActivePaneId).SessionId;
+            if (sessionId is { } id) _closingSessions.Remove(id);
+        }
+        _ = StartTerminalAsync(commandLine, workingDirectory, profileName);
+    }
+
+    private async Task StartTerminalAsync(string commandLine, string workingDirectory, string profileName)
+    {
+        if (_connection is not null || _activeTab is null || _activePane is null) return;
+        var tabState = _activeTab;
+        var paneState = _activePane;
+        var pane = tabState.Tab.RootPane.Terminals().First(p => p.Id == tabState.Tab.ActivePaneId);
+        var sessionId = pane.SessionId!.Value;
         var environment = new Dictionary<string, string>
         {
-            ["CMUX_WORKSPACE_ID"] = _activeTab.WorkspaceId.ToString(),
+            ["CMUX_WORKSPACE_ID"] = tabState.WorkspaceId.ToString(),
             ["CMUX_PANE_ID"] = pane.Id.ToString(),
-            ["CMUX_SESSION_ID"] = pane.SessionId!.Value.ToString(),
+            ["CMUX_SESSION_ID"] = sessionId.ToString(),
             ["CMUX_PIPE_NAME"] = _eventServer.PipeName,
         };
-        _connection = new ConptyConnection(commandLine, workingDirectory, environment);
-        _activePane!.Status = AgentStatus.Unknown;
-        _activePane.CompletionRead = false;
-        Title = $"cmux — {profileName}";
-        Boot();
+        var connection = new ConptyConnection(commandLine, workingDirectory, environment);
+        connection.Faulted += OnConnectionFaulted;
+        _connection = connection;
+        paneState.Status = AgentStatus.Unknown;
+        paneState.CompletionRead = false;
+        paneState.CurrentDirectory = workingDirectory;
         _lastCommandLine = commandLine;
         _lastWorkingDirectory = workingDirectory;
-        _activePane!.CurrentDirectory = workingDirectory;
         _lastProfileName = profileName;
-        UpdatePaneLabel(_activePane!);
-        var sessionId = pane.SessionId!.Value;
-        _workspaces.SetTerminalLaunch(_activeTab.WorkspaceId, _activeTab.Tab.Id, sessionId,
+        _workspaces.SetTerminalLaunch(tabState.WorkspaceId, tabState.Tab.Id, sessionId,
             profileName, commandLine, workingDirectory, profileName);
         MarkLayoutDirty();
+        Title = $"WinPaneDock — {profileName}";
+        UpdatePaneLabel(paneState);
         ProfilePicker.IsEnabled = true;
         StartButton.IsEnabled = false;
         RestartButton.IsEnabled = true;
         CloseButton.IsEnabled = true;
         KillButton.IsEnabled = true;
         FocusButton.IsEnabled = true;
+
+        try
+        {
+            await connection.PrepareHostAsync().ConfigureAwait(true);
+            await Dispatcher.InvokeAsync(() =>
+            {
+                if (paneState.Connection != connection) return;
+                if (_closingSessions.Contains(sessionId))
+                {
+                    // The explicit close already ended the shell, so this connection is
+                    // disposable. Clear the pane reference too, otherwise the pane keeps a
+                    // disposed connection and Start stays disabled until the user retries.
+                    paneState.Connection = null;
+                    paneState.ControlAttached = false;
+                    connection.Dispose();
+                    if (ReferenceEquals(_activePane, paneState)) UpdatePaneLabel(paneState);
+                    return;
+                }
+                _workspaces.SetTerminalLaunch(tabState.WorkspaceId, tabState.Tab.Id, sessionId,
+                    profileName, commandLine, workingDirectory, profileName);
+                App.Diagnostics.Write(DiagnosticLevel.Info, "terminal.started",
+                    $"workspaceId={tabState.WorkspaceId} groupId={tabState.Tab.Id} sessionId={sessionId} processId={connection.ProcessId} profile={profileName}");
+                if (ReferenceEquals(_activePane, paneState)) Boot();
+                MarkLayoutDirty();
+            });
+        }
+        catch (Exception ex)
+        {
+            App.Log($"Terminal start failed: {ex}");
+            await Dispatcher.InvokeAsync(() =>
+            {
+                if (paneState.Connection != connection) return;
+                paneState.Connection = null;
+                connection.Dispose();
+                if (ReferenceEquals(_activePane, paneState))
+                {
+                    CloseTerminal(false);
+                    StatusText.Text = $"START FAILED: {ex.Message}";
+                }
+            });
+        }
     }
 
     private void CloseTerminal(bool kill)
     {
         if (_activePane is null || _activeTab is null) return;
         var leaf = _activeTab.Tab.RootPane.Terminals().First(p => p.Id == _activeTab.Tab.ActivePaneId);
-        try { ClosePaneConnection(_activePane, kill); }
-        finally
+        var sessionId = leaf.SessionId!.Value;
+        _closingSessions.Add(sessionId);
+        var pending = CaptureAndClearLaunches([(_activeTab.WorkspaceId, _activeTab.Tab, leaf)]);
+        if (!CommitLayout("terminal-close-intent", force: true))
         {
-            _workspaces.ClearTerminalLaunch(_activeTab.WorkspaceId, _activeTab.Tab.Id, leaf.SessionId!.Value);
+            _closingSessions.Remove(sessionId);
+            RestoreLaunches(pending);
             MarkLayoutDirty();
+            return;
         }
+        if (!ClosePaneConnection(_activePane, kill))
+            StatusText.Text = "Terminal close failed; the pane was kept so you can retry.";
     }
 
     private int CloseAllTerminals()
     {
+        var leaves = _tabs.Values.SelectMany(tab => tab.Tab.RootPane.Terminals()
+            .Select(leaf => (tab.WorkspaceId, tab.Tab, leaf))).ToArray();
+        var pending = CaptureAndClearLaunches(leaves);
+        foreach (var item in pending) _closingSessions.Add(item.SessionId);
+        if (!CommitLayout("close-all-intent", force: true))
+        {
+            foreach (var item in pending) _closingSessions.Remove(item.SessionId);
+            RestoreLaunches(pending);
+            MarkLayoutDirty();
+            return 0;
+        }
         var closed = 0;
+        var failed = 0;
         foreach (var tab in _tabs.Values)
             foreach (var leaf in tab.Tab.RootPane.Terminals())
             {
@@ -1420,55 +1499,104 @@ public partial class MainWindow : Window
                 var pane = tab.Panes[sessionId];
                 if (pane.Connection is not null)
                 {
-                    ClosePaneConnection(pane, false);
-                    closed++;
+                    if (ClosePaneConnection(pane, false)) closed++;
+                    else failed++;
                 }
-                _workspaces.ClearTerminalLaunch(tab.WorkspaceId, tab.Tab.Id, sessionId);
             }
         RefreshWorkspaces();
-        MarkLayoutDirty();
-        SaveLayout();
+        if (failed > 0) StatusText.Text = $"{failed} terminal(s) could not be closed; retry them individually.";
         return closed;
     }
 
-    private void ClosePaneConnection(PaneState state, bool kill)
+    private bool ClosePaneConnection(PaneState state, bool kill, bool detached = false)
     {
-        if (state.Connection is null) return;
+        if (state.Connection is null) return true;
         var connection = state.Connection;
+        try
+        {
+            if (detached) connection.Detach();
+            else if (kill) connection.Kill();
+            else connection.Close();
+        }
+        catch (Exception ex)
+        {
+            App.Log($"Terminal close failed for session {connection.CommandLine}: {ex}");
+            if (state == _activePane) StatusText.Text = $"Terminal close failed: {ex.Message}";
+            return false;
+        }
+
         state.Connection = null;
-        UpdatePaneLabel(state);
+        state.ControlAttached = false;
         try { state.Control.Connection = null!; }
-        finally { if (kill) connection.Kill(); else connection.Close(); }
-        if (state != _activePane) return;
+        catch (Exception ex) { App.Log($"Terminal control detach failed: {ex}"); }
+        UpdatePaneLabel(state);
+        App.Diagnostics.Write(DiagnosticLevel.Info, detached ? "terminal.detached" : "terminal.closed",
+            $"processId={connection.ProcessId} killed={kill}");
+        if (state != _activePane) return true;
         ProfilePicker.IsEnabled = true;
         StartButton.IsEnabled = true;
         RestartButton.IsEnabled = _lastCommandLine is not null;
         CloseButton.IsEnabled = false;
         KillButton.IsEnabled = false;
         FocusButton.IsEnabled = false;
-        Title = "cmux — Select profile";
+        Title = "WinPaneDock — Select profile";
         StatusText.Text = kill ? "Terminal killed." : "Terminal closed.";
+        return true;
+    }
+
+    private void OnConnectionFaulted(object? sender, string message)
+    {
+        App.Log($"Terminal connection fault: {message}");
+        Dispatcher.BeginInvoke(new Action(() =>
+        {
+            if (sender is not ConptyConnection connection || _tabs.Values
+                .SelectMany(tab => tab.Panes.Values).All(pane => pane.Connection != connection)) return;
+            StatusText.Text = $"TERMINAL CONNECTION ERROR: {message}";
+        }));
+    }
+
+    private void ApplyTerminalAppearance(PaneState pane)
+    {
+        if (_settings is null) return;
+        pane.Control.Margin = new Thickness(_settings.Padding);
+        pane.Control.SetTheme(_settings.CreateTheme(_uiTheme),
+            _fontOverride ?? _settings.FontFamily, _settings.FontSize);
+    }
+
+    /// <summary>
+    /// Binds a connection to a pane's control. TerminalContainer discards output that arrives
+    /// before its native window exists, so a control that is not loaded yet must be flagged for
+    /// a buffered replay once it realises.
+    /// </summary>
+    private void AttachControlConnection(PaneState pane, ConptyConnection connection)
+    {
+        if (!pane.Control.IsLoaded) pane.NeedsOutputReplay = true;
+        // The Connection setter calls connection.Start() (official behaviour).
+        pane.Control.Connection = connection;
+        pane.ControlAttached = true;
     }
 
     private void Boot()
     {
-        // Connection 的 setter 会调用 connection.Start() (官方行为)。
-        Terminal.Connection = _connection;
-        Terminal.Margin = new Thickness(_settings!.Padding);
-        Terminal.SetTheme(_settings.CreateTheme(_uiTheme), _fontOverride ?? _settings.FontFamily, _settings.FontSize);
+        var pane = _activePane ?? throw new InvalidOperationException("No pane selected.");
+        AttachControlConnection(pane, pane.Connection!);
+        ApplyTerminalAppearance(pane);
         Terminal.Focus();
-        UpdateStatus();
+        QueueStatusUpdate();
     }
 
     private void OnClosing(object? sender, System.ComponentModel.CancelEventArgs e)
     {
+        App.Diagnostics.Write(DiagnosticLevel.Info, "gui.closing", $"attachedTerminals={_tabs.Values.Sum(t => t.Panes.Values.Count(p => p.Connection is not null))}");
         ComponentDispatcher.ThreadFilterMessage -= OnThreadFilterMessage;
         _statusTimer.Stop();
         _gitTimer.Stop();
-        SaveLayout();
+        SaveLayout(force: _tabs.Values.SelectMany(tab => tab.Panes.Values)
+            .Any(pane => pane.Connection is not null));
         _eventServer.Dispose();
         _guiCommandServer.Dispose();
         _notifyIcon.Dispose();
+        _appIcon.Dispose();
         UnregisterWindowHotkeys();
         _windowSource?.RemoveHook(OnWindowMessage);
         try
@@ -1476,14 +1604,13 @@ public partial class MainWindow : Window
             foreach (var state in _tabs.Values)
                 foreach (var pane in state.Panes.Values)
                 {
-                    pane.Connection?.Detach();
-                    ClosePaneConnection(pane, false);
+                    ClosePaneConnection(pane, false, detached: true);
                 }
         }
         catch (Exception ex)
         {
             // 关闭路径不允许抛出导致 Crash (M0 Gate)。
-            System.Diagnostics.Trace.WriteLine($"close failed: {ex.Message}");
+            App.Diagnostics.Write(DiagnosticLevel.Error, "gui.close.failed", exception: ex);
         }
     }
 
@@ -1497,13 +1624,78 @@ public partial class MainWindow : Window
             var directories = workspaces.Select(w => w.RootDirectory)
                 .Concat(_tabs.Values.SelectMany(t => t.Panes.Values).Select(p => p.CurrentDirectory).OfType<string>())
                 .Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
-            var results = await Task.WhenAll(directories.Select(async directory =>
-                (Directory: directory, Context: await Task.Run(() => GitProjectContext.ReadAsync(directory)))));
-            foreach (var result in results) _directoryGitContexts[result.Directory] = result.Context;
+
+            var referenced = directories.ToHashSet(StringComparer.OrdinalIgnoreCase);
+            foreach (var stale in _gitWorktreeRoots.Keys.Where(directory => !referenced.Contains(directory)).ToArray())
+            {
+                _gitWorktreeRoots.Remove(stale);
+                _gitRootResolvedAt.Remove(stale);
+                _gitResolutionFailures.Remove(stale);
+            }
+            foreach (var stale in _gitRootResolvedAt.Keys.Where(directory => !referenced.Contains(directory)).ToArray())
+                _gitRootResolvedAt.Remove(stale);
+            foreach (var stale in _gitResolutionFailures.Keys.Where(directory => !referenced.Contains(directory)).ToArray())
+                _gitResolutionFailures.Remove(stale);
+
+            var now = DateTimeOffset.UtcNow;
+            var unresolved = directories.Where(directory =>
+                (!_gitWorktreeRoots.ContainsKey(directory) &&
+                    (!_gitResolutionFailures.TryGetValue(directory, out var failedAt) || now - failedAt > TimeSpan.FromSeconds(30))) ||
+                (_gitRootResolvedAt.TryGetValue(directory, out var resolvedAt) && now - resolvedAt > TimeSpan.FromMinutes(5))).ToArray();
+            if (unresolved.Length > 0)
+            {
+                var resolved = new ConcurrentDictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
+                await Task.WhenAll(unresolved.Select(async directory =>
+                {
+                    await _gitQueryGate.WaitAsync();
+                    try { resolved[directory] = await GitProjectContext.ReadWorktreeRootAsync(directory); }
+                    finally { _gitQueryGate.Release(); }
+                }));
+                foreach (var pair in resolved)
+                {
+                    if (pair.Value is null)
+                    {
+                        _gitWorktreeRoots.Remove(pair.Key);
+                        _gitRootResolvedAt.Remove(pair.Key);
+                        _gitResolutionFailures[pair.Key] = DateTimeOffset.UtcNow;
+                    }
+                    else
+                    {
+                        _gitWorktreeRoots[pair.Key] = pair.Value;
+                        _gitRootResolvedAt[pair.Key] = DateTimeOffset.UtcNow;
+                        _gitResolutionFailures.Remove(pair.Key);
+                    }
+                }
+            }
+
+            var roots = directories.Where(directory =>
+                !_gitResolutionFailures.TryGetValue(directory, out var failedAt) ||
+                now - failedAt > TimeSpan.FromSeconds(30))
+                .Select(directory => _gitWorktreeRoots.TryGetValue(directory, out var root) && root is not null ? root : directory)
+                .Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+            var contexts = new ConcurrentDictionary<string, GitProjectContext?>(StringComparer.OrdinalIgnoreCase);
+            await Task.WhenAll(roots.Select(async root =>
+            {
+                await _gitQueryGate.WaitAsync();
+                try { contexts[root] = await GitProjectContext.ReadAsync(root); }
+                finally { _gitQueryGate.Release(); }
+            }));
+
+            var current = new Dictionary<string, GitProjectContext?>(StringComparer.OrdinalIgnoreCase);
+            foreach (var directory in directories)
+            {
+                var root = _gitWorktreeRoots.TryGetValue(directory, out var resolvedRoot) && resolvedRoot is not null
+                    ? resolvedRoot : directory;
+                current[directory] = contexts.TryGetValue(root, out var context) ? context : null;
+            }
+            foreach (var stale in _directoryGitContexts.Keys
+                .Where(directory => !current.ContainsKey(directory)).ToArray())
+                _directoryGitContexts.Remove(stale);
+            foreach (var pair in current) _directoryGitContexts[pair.Key] = pair.Value;
             foreach (var workspace in workspaces)
-                _gitContexts[workspace.Id] = _directoryGitContexts[workspace.RootDirectory];
+                _gitContexts[workspace.Id] = _directoryGitContexts.GetValueOrDefault(workspace.RootDirectory);
             RefreshWorkspaceSidebar();
-            UpdateStatus();
+            UpdateStatusText();
         }
         catch (Exception ex) { App.Log($"Git context refresh failed: {ex}"); }
         finally { _gitRefreshing = false; }
@@ -1609,18 +1801,73 @@ public partial class MainWindow : Window
     [DllImport("user32.dll")]
     private static extern IntPtr DispatchMessage(ref MSG message);
 
+    private void QueueStatusUpdate()
+    {
+        if (_statusRefreshing) return;
+        var probes = CaptureStatusProbes();
+        if (probes.All(probe => probe.Connection is null))
+        {
+            ApplyStatusProbes(probes, new AgentProcessSnapshot([]));
+            return;
+        }
+        _statusRefreshing = true;
+        var generation = Interlocked.Increment(ref _statusGeneration);
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                var snapshot = new AgentProcessSnapshot(AgentDetector.Scan());
+                Dispatcher.BeginInvoke(new Action(() =>
+                {
+                    if (generation != _statusGeneration)
+                    {
+                        _statusRefreshing = false;
+                        return;
+                    }
+                    _statusRefreshing = false;
+                    ApplyStatusProbes(probes, snapshot);
+                }));
+            }
+            catch (Exception ex)
+            {
+                App.Log($"Background status scan failed: {ex}");
+                if (!Dispatcher.HasShutdownStarted)
+                    Dispatcher.BeginInvoke(new Action(() => _statusRefreshing = false));
+            }
+        });
+    }
+
     private void UpdateStatus()
     {
-        var processes = AgentDetector.Scan();
-        foreach (var tab in _tabs.Values)
-            foreach (var pane in tab.Panes.Values)
-            {
-                pane.Detection = pane.Connection is { } connection
-                    ? AgentDetector.Detect(connection.ProcessId, processes, connection.CommandLine, pane.LastProfileName ?? "")
-                    : new AgentDetection(AgentType.Unknown, AgentDetectionSource.None, 0);
-                UpdatePaneLabel(pane);
-            }
+        Interlocked.Increment(ref _statusGeneration);
+        var probes = CaptureStatusProbes();
+        var snapshot = probes.Any(probe => probe.Connection is not null)
+            ? new AgentProcessSnapshot(AgentDetector.Scan()) : new AgentProcessSnapshot([]);
+        ApplyStatusProbes(probes, snapshot);
+    }
+
+    private StatusProbe[] CaptureStatusProbes() => _tabs.Values
+        .SelectMany(tab => tab.Panes.Values)
+        .Select(pane => new StatusProbe(pane, pane.Connection, pane.Connection?.ProcessId ?? 0,
+            pane.Connection?.CommandLine ?? "", pane.LastProfileName ?? ""))
+        .ToArray();
+
+    private void ApplyStatusProbes(StatusProbe[] probes, AgentProcessSnapshot processes)
+    {
+        foreach (var probe in probes)
+        {
+            if (probe.Pane.Connection != probe.Connection) continue;
+            probe.Pane.Detection = probe.Connection is not null
+                ? AgentDetector.Detect(probe.ProcessId, processes, probe.CommandLine, probe.ProfileName)
+                : new AgentDetection(AgentType.Unknown, AgentDetectionSource.None, 0);
+            UpdatePaneLabel(probe.Pane);
+        }
         RefreshWorkspaceSidebar();
+        UpdateStatusText();
+    }
+
+    private void UpdateStatusText()
+    {
         if (_connection is null) return;
         var pid = _connection.ProcessId;
         var alive = false;
@@ -1634,7 +1881,7 @@ public partial class MainWindow : Window
             ? context : null;
         var branch = git is null ? "" : $"    •    {git.Branch}{(git.IsDirty ? " *" : "")}";
         StatusText.Text =
-            $"{_workspaces.Active?.Name}  /  {_activeTab?.Tab.Title}    •    {_lastProfileName}    •    {_activePane?.Detection.Type}: {_activePane?.Status}    •    {directory}{branch}";
+            $"{_workspaces.Active?.Name}  /  {_activeTab?.Tab.Title}    •    {_lastProfileName}    •    {(_activePane is { } activePane ? ActivityLabel(activePane) : "No terminal")}    •    {directory}{branch}";
         StatusText.ToolTip =
             $"{_connection.CommandLine}\nAgent source: {_activePane?.Detection.Source}\nFont: {_fontOverride ?? _settings?.FontFamily}\n{Terminal.Rows}x{Terminal.Columns}\nShell PID: {pid} {(alive ? "alive" : "n/a")}";
     }
@@ -1649,11 +1896,15 @@ public partial class MainWindow : Window
         {
             if (!Directory.Exists(directory)) return false;
             pane.CurrentDirectory = Path.GetFullPath(directory);
-            UpdateStatus();
+            QueueStatusUpdate();
+            UpdateStatusText();
             return true;
         }
         var previous = pane.Status;
         pane.Status = agentEvent.Status;
+        if (previous != agentEvent.Status)
+            App.Diagnostics.Write(DiagnosticLevel.Info, "agent.status.changed",
+                $"sessionId={agentEvent.SessionId} from={previous} to={agentEvent.Status}");
         if (agentEvent.Status == AgentStatus.Working) pane.CompletionRead = false;
         if (agentEvent.Status is AgentStatus.Waiting or AgentStatus.Completed)
             pane.CompletionRead = IsActive && pane.Control.IsKeyboardFocusWithin;
@@ -1668,7 +1919,8 @@ public partial class MainWindow : Window
                 $"{workspace.Name} / {tab.Tab.Title}", System.Windows.Forms.ToolTipIcon.Info);
         }
         UpdatePaneLabel(pane);
-        UpdateStatus();
+        QueueStatusUpdate();
+        UpdateStatusText();
         return true;
     }
 
@@ -1709,14 +1961,6 @@ public partial class MainWindow : Window
         }
 
         return (profile, commandLine, font);
-    }
-
-    private static int ParseSmokeCycles(string[] args)
-    {
-        for (var i = 1; i < args.Length - 1; i++)
-            if (args[i] == "--lifecycle-smoke" && int.TryParse(args[i + 1], out var cycles) && cycles is > 0 and <= 500)
-                return cycles;
-        return 0;
     }
 
     private static string? ReadOption(string[] args, string name)

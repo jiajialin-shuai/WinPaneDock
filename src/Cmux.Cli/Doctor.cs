@@ -2,6 +2,7 @@ using System.IO.Pipes;
 using System.Runtime.InteropServices;
 using System.Security.Principal;
 using System.Text.Json;
+using Cmux.Core;
 
 internal static class Doctor
 {
@@ -56,7 +57,8 @@ internal static class Doctor
         if (OperatingSystem.IsWindows()) try
         {
             var sid = WindowsIdentity.GetCurrent().User!.Value.Replace('-', '_');
-            using var pipe = new NamedPipeClientStream(".", "cmux-session-host-" + sid, PipeDirection.InOut);
+            using var pipe = new NamedPipeClientStream(".",
+                InstanceScope.Qualify("cmux-session-host-" + sid), PipeDirection.InOut);
             pipe.Connect(300);
             daemon = pipe.IsConnected;
         }

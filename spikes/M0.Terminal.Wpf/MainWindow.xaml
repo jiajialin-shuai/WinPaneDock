@@ -1,7 +1,9 @@
 <Window x:Class="Cmux.Spike.Terminal.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="cmux M0 spike — Windows Terminal control"
+        xmlns:local="clr-namespace:Cmux.Spike.Terminal"
+        Title="WinPaneDock"
+        Icon="pack://application:,,,/Assets/Cmux.ico"
         Width="1280"
         Height="760"
         MinWidth="800"
@@ -178,7 +180,7 @@
             </Setter>
         </Style>
     </Window.Resources>
-    <Grid>
+    <Grid x:Name="RootLayout">
         <Grid.ColumnDefinitions>
             <ColumnDefinition x:Name="SidebarColumn" Width="240" />
             <ColumnDefinition Width="*" />
@@ -203,7 +205,7 @@
                 </Grid.RowDefinitions>
                 <StackPanel Orientation="Horizontal" Margin="0,1,0,16">
                     <TextBlock Text="●" Foreground="#FFD71921" FontSize="10" VerticalAlignment="Center" Margin="0,0,9,0" />
-                    <TextBlock Text="CMUX / WORKSPACES" Foreground="{DynamicResource UiText}" FontWeight="SemiBold" FontSize="12" VerticalAlignment="Center" />
+                    <TextBlock Text="WINPANEDOCK / WORKSPACES" Foreground="{DynamicResource UiText}" FontWeight="SemiBold" FontSize="12" VerticalAlignment="Center" />
                 </StackPanel>
                 <Border Grid.Row="1" Height="76" Margin="0,-5,0,10" ClipToBounds="True">
                     <Image Source="Assets/sidebar-ornament-dual.png" Stretch="Uniform" Opacity="0.6" />
@@ -217,29 +219,57 @@
                     <TextBox x:Name="WorkspaceRootInput" />
                 </StackPanel>
                 <ListBox x:Name="WorkspaceList" Grid.Row="4" SelectionChanged="OnWorkspaceSelectionChanged">
+                    <ListBox.ItemContainerStyle>
+                        <Style TargetType="ListBoxItem" BasedOn="{StaticResource {x:Type ListBoxItem}}">
+                            <Setter Property="Padding" Value="0" />
+                        </Style>
+                    </ListBox.ItemContainerStyle>
                     <ListBox.ItemTemplate>
                         <DataTemplate>
-                            <StackPanel Margin="0,2,0,6">
-                                <TextBlock Text="{Binding Name}" FontWeight="SemiBold" FontSize="13" TextTrimming="CharacterEllipsis" />
-                                <TextBlock Text="{Binding Branch}" Foreground="{DynamicResource UiMuted}" FontSize="11" Margin="12,3,0,4" TextTrimming="CharacterEllipsis">
-                                    <TextBlock.Style>
-                                        <Style TargetType="TextBlock">
-                                            <Style.Triggers><DataTrigger Binding="{Binding Branch}" Value="{x:Null}"><Setter Property="Visibility" Value="Collapsed" /></DataTrigger></Style.Triggers>
-                                        </Style>
-                                    </TextBlock.Style>
-                                </TextBlock>
-                                <ItemsControl ItemsSource="{Binding Terminals}" Margin="15,0,0,0">
+                            <Border x:Name="WorkspaceCard" Margin="3,3,3,9" Padding="10,8" Background="{DynamicResource UiSurface}"
+                                    BorderBrush="{DynamicResource UiBorder}" BorderThickness="1" CornerRadius="6">
+                                <StackPanel>
+                                    <TextBlock Text="{Binding Name}" FontWeight="SemiBold" FontSize="16" TextTrimming="CharacterEllipsis" />
+                                    <TextBlock Text="{Binding Branch}" Foreground="{DynamicResource UiMuted}" FontSize="11" Margin="2,3,0,5" TextTrimming="CharacterEllipsis">
+                                        <TextBlock.Style>
+                                            <Style TargetType="TextBlock">
+                                                <Style.Triggers><DataTrigger Binding="{Binding Branch}" Value="{x:Null}"><Setter Property="Visibility" Value="Collapsed" /></DataTrigger></Style.Triggers>
+                                            </Style>
+                                        </TextBlock.Style>
+                                    </TextBlock>
+                                    <ItemsControl ItemsSource="{Binding Groups}">
                                     <ItemsControl.ItemTemplate>
                                         <DataTemplate>
-                                            <Grid Margin="0,2,0,2">
-                                                <Grid.ColumnDefinitions><ColumnDefinition Width="12" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
-                                                <Ellipse Width="7" Height="7" Fill="{Binding DotBrush}" ToolTip="{Binding StatusText}" VerticalAlignment="Center" />
-                                                <TextBlock Grid.Column="1" Text="{Binding Name}" ToolTip="{Binding StatusText}" FontSize="11" TextTrimming="CharacterEllipsis" Foreground="{DynamicResource UiMuted}" />
-                                            </Grid>
+                                            <StackPanel Margin="8,4,0,2">
+                                                <TextBlock Text="{Binding Name}" FontSize="12" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" />
+                                                <ItemsControl ItemsSource="{Binding Terminals}" Margin="8,2,0,0">
+                                                    <ItemsControl.ItemTemplate>
+                                                        <DataTemplate>
+                                                            <Grid Margin="0,2,0,2">
+                                                                <Grid.ColumnDefinitions><ColumnDefinition Width="12" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+                                                                <Ellipse Width="7" Height="7" Fill="{Binding DotBrush}" ToolTip="{Binding StatusText}" VerticalAlignment="Center" />
+                                                                <TextBlock Grid.Column="1" Text="{Binding Name}" ToolTip="{Binding StatusText}" FontSize="11" TextTrimming="CharacterEllipsis" Foreground="{DynamicResource UiMuted}" />
+                                                            </Grid>
+                                                        </DataTemplate>
+                                                    </ItemsControl.ItemTemplate>
+                                                </ItemsControl>
+                                            </StackPanel>
                                         </DataTemplate>
                                     </ItemsControl.ItemTemplate>
-                                </ItemsControl>
-                            </StackPanel>
+                                    </ItemsControl>
+                                </StackPanel>
+                            </Border>
+                            <DataTemplate.Triggers>
+                                <DataTrigger Binding="{Binding IsSelected, RelativeSource={RelativeSource AncestorType=ListBoxItem}}" Value="True">
+                                    <Setter TargetName="WorkspaceCard" Property="BorderBrush" Value="#FF4FB8FF" />
+                                    <Setter TargetName="WorkspaceCard" Property="BorderThickness" Value="2" />
+                                    <Setter TargetName="WorkspaceCard" Property="Effect">
+                                        <Setter.Value>
+                                            <DropShadowEffect Color="#FF4FB8FF" BlurRadius="18" ShadowDepth="0" Opacity="0.9" />
+                                        </Setter.Value>
+                                    </Setter>
+                                </DataTrigger>
+                            </DataTemplate.Triggers>
                         </DataTemplate>
                     </ListBox.ItemTemplate>
                 </ListBox>
@@ -265,7 +295,8 @@
                 <Button Content="+ Group" Click="OnNewTabClicked" />
             </StackPanel>
             <StackPanel Grid.Column="2" Orientation="Horizontal">
-                <ComboBox x:Name="ThemePicker" Width="94" SelectionChanged="OnThemeChanged" ToolTip="Appearance" Margin="0,0,6,0">
+                <ComboBox x:Name="ThemePicker" Width="94" SelectionChanged="OnThemeChanged"
+                          ToolTip="Changes WinPaneDock and terminal colors. CLI apps may need their own /theme setting." Margin="0,0,6,0">
                     <ComboBoxItem Content="Night" /><ComboBoxItem Content="Day" /><ComboBoxItem Content="Gray" />
                 </ComboBox>
                 <Button x:Name="SettingsButton" Content="Settings" MinWidth="78" ToolTip="Settings and more" Click="OnSettingsClicked" Margin="0" />
@@ -304,15 +335,30 @@
             <Grid x:Name="TerminalHost" Grid.Row="2" Background="{DynamicResource UiTerminal}" />
         </Grid>
 
-        <!-- 状态栏: 只用于 M0 观测, 不参与终端输入链路 -->
+        <!-- 状态栏: 只用于 M0 观测, 不参与终端输入链路。右下角常驻版本号, 便于确认当前构建。 -->
         <Border Grid.Row="2" Grid.Column="1"
                 Background="{DynamicResource UiPanel}"
                 Padding="8,4">
-            <TextBlock x:Name="StatusText"
-                       Foreground="{DynamicResource UiMuted}"
-                       FontFamily="Segoe UI"
-                       FontSize="12"
-                       Text="starting..." />
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+                <TextBlock x:Name="StatusText"
+                           Foreground="{DynamicResource UiMuted}"
+                           FontFamily="Segoe UI"
+                           FontSize="12"
+                           Text="starting..." />
+                <TextBlock Grid.Column="1"
+                           Margin="12,0,0,0"
+                           VerticalAlignment="Center"
+                           Foreground="{DynamicResource UiMuted}"
+                           FontFamily="Consolas, Segoe UI"
+                           FontSize="11"
+                           Opacity="0.75"
+                           Text="{x:Static local:App.AppVersion}"
+                           ToolTip="WinPaneDock build. The package version is stamped from Directory.Build.props." />
+            </Grid>
         </Border>
         <Popup x:Name="PalettePopup" Grid.Row="0" Grid.Column="1"
                PlacementTarget="{Binding ElementName=ProfileBar}" Placement="Bottom"
@@ -350,16 +396,23 @@
                 </StackPanel>
             </Border>
         </Popup>
-        <Popup x:Name="NewWorkspacePopup" PlacementTarget="{Binding ElementName=WorkspaceList}" Placement="Center"
-               StaysOpen="False" AllowsTransparency="True">
-            <Border Width="320" Padding="16" Background="{DynamicResource UiPanel}" BorderBrush="{DynamicResource UiBorder}" BorderThickness="1" CornerRadius="9">
+        <Popup x:Name="NewWorkspacePopup" PlacementTarget="{Binding ElementName=RootLayout}" Placement="Center"
+               StaysOpen="True" AllowsTransparency="True">
+            <Border Width="440" Padding="16" Background="{DynamicResource UiPanel}" BorderBrush="{DynamicResource UiBorder}" BorderThickness="1" CornerRadius="9">
                 <StackPanel>
                     <TextBlock Text="NEW WORKSPACE" FontWeight="SemiBold" FontSize="14" Margin="0,0,0,14" />
                     <TextBlock Text="NAME" Foreground="{DynamicResource UiMuted}" FontSize="11" Margin="0,0,0,5" />
-                    <TextBox x:Name="NewWorkspaceNameInput" Margin="0,0,0,12" />
+                    <TextBox x:Name="NewWorkspaceNameInput" Margin="0,0,0,12" KeyDown="OnNewWorkspaceKeyDown" />
                     <TextBlock Text="ROOT DIRECTORY" Foreground="{DynamicResource UiMuted}" FontSize="11" Margin="0,0,0,5" />
-                    <TextBox x:Name="NewWorkspaceRootInput" Margin="0,0,0,8" />
-                    <TextBlock x:Name="NewWorkspaceError" Foreground="LightCoral" TextWrapping="Wrap" Margin="0,0,0,8" />
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <TextBox x:Name="NewWorkspaceRootInput" Margin="0,0,8,0" />
+                        <Button Grid.Column="1" Content="Browse..." Padding="10,0" Click="OnBrowseWorkspaceRootClicked" />
+                    </Grid>
+                    <TextBlock x:Name="NewWorkspaceError" Foreground="LightCoral" TextWrapping="Wrap" Margin="0,8,0,8" />
                     <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
                         <Button Content="Cancel" Click="OnCancelNewWorkspaceClicked" />
                         <Button Content="Create" Click="OnCreateWorkspaceClicked" Margin="0" />
@@ -381,5 +434,16 @@
                 </StackPanel>
             </Border>
         </Popup>
+
+        <!--
+            The new-workspace dialog is modal on purpose: the root path often has to be
+            copied out of it, so it must survive focus changes and stray clicks. This
+            scrim blocks the rest of the window and is the only "click the blank area to
+            dismiss" surface. It lives in the owner window, so the popup's own HWND stays
+            on top of it and the inputs remain selectable.
+        -->
+        <Border x:Name="NewWorkspaceScrim" Grid.Column="0" Grid.ColumnSpan="2" Grid.Row="0" Grid.RowSpan="3"
+                Panel.ZIndex="1000" Background="#99000000" Visibility="Collapsed"
+                MouseLeftButtonDown="OnNewWorkspaceScrimClick" />
     </Grid>
 </Window>

@@ -15,7 +15,7 @@ public sealed class AgentEventServer(Func<AgentEvent, bool> handleEvent) : IDisp
         Converters = { new JsonStringEnumConverter() },
     };
 
-    public string PipeName { get; } = SessionHostProtocol.PipeName + "-events";
+    public string PipeName { get; } = SessionHostProtocol.EventPipeName;
 
     public void Start() => _ = Task.Run(ListenAsync);
 
@@ -30,12 +30,20 @@ public sealed class AgentEventServer(Func<AgentEvent, bool> handleEvent) : IDisp
                 await pipe.WaitForConnectionAsync(_stop.Token);
                 using var reader = new StreamReader(pipe, leaveOpen: true);
                 using var writer = new StreamWriter(pipe, leaveOpen: true) { AutoFlush = true };
-                var line = await reader.ReadLineAsync(_stop.Token);
+                using var deadline = CancellationTokenSource.CreateLinkedTokenSource(_stop.Token);
+                deadline.CancelAfter(NamedPipeProtocol.DefaultRequestTimeoutMs);
+                var line = await NamedPipeProtocol.ReadLineAsync(reader, NamedPipeProtocol.MaxRequestChars,
+                    deadline.Token);
                 var agentEvent = line is null ? null : JsonSerializer.Deserialize<AgentEvent>(line, JsonOptions);
                 var accepted = agentEvent is not null && handleEvent(agentEvent);
-                await writer.WriteLineAsync(accepted ? "OK" : "Unknown cmux session.");
+                await NamedPipeProtocol.WriteLineAsync(writer,
+                    accepted ? "OK" : "Unknown WinPaneDock session.", deadline.Token);
             }
-            catch (OperationCanceledException) { break; }
+            catch (OperationCanceledException) when (_stop.IsCancellationRequested) { break; }
+            catch (OperationCanceledException)
+            {
+                App.Diagnostics.Write(DiagnosticLevel.Warning, "agent-event.timeout");
+            }
             catch (Exception ex)
             {
                 App.Log($"Agent event pipe failed: {ex}");
@@ -45,8 +53,5 @@ public sealed class AgentEventServer(Func<AgentEvent, bool> handleEvent) : IDisp
         }
     }
 
-    public void Dispose()
-    {
-        _stop.Cancel();
-    }
+    public void Dispose() => _stop.Cancel();
 }

@@ -1,16 +1,24 @@
-using System.IO;
 using System.Windows;
 using System.Windows.Threading;
+using Cmux.Core;
 
 namespace Cmux.Spike.Terminal;
 
 public partial class App : System.Windows.Application
 {
-    private static readonly string LogPath = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "cmux", "logs", "app.log");
+    public static DiagnosticLog Diagnostics { get; } = new("gui");
+
+    /// <summary>
+    /// Build identity for the UI, taken from the same <c>Directory.Build.props</c> version the
+    /// package manifest is stamped with, so the corner readout and the installed MSIX can never
+    /// disagree.
+    /// </summary>
+    public static string AppVersion { get; } =
+        typeof(App).Assembly.GetName().Version?.ToString() ?? "unknown";
 
     public App()
     {
+        Diagnostics.Write(DiagnosticLevel.Info, "gui.start", $"version={typeof(App).Assembly.GetName().Version}");
         // M0 取证: 任何未处理异常都必须落到文件, 不允许静默崩溃。
         DispatcherUnhandledException += OnDispatcherUnhandledException;
         AppDomain.CurrentDomain.UnhandledException += (_, e) =>
@@ -19,18 +27,7 @@ public partial class App : System.Windows.Application
             Log($"UnobservedTaskException: {e.Exception}");
     }
 
-    public static void Log(string message)
-    {
-        try
-        {
-            Directory.CreateDirectory(Path.GetDirectoryName(LogPath)!);
-            File.AppendAllText(LogPath, $"[{DateTime.Now:HH:mm:ss.fff}] {message}{Environment.NewLine}");
-        }
-        catch
-        {
-            // 日志失败不允许二次崩溃。
-        }
-    }
+    public static void Log(string message) => Diagnostics.Write(DiagnosticLevel.Error, "gui.error", message);
 
     private void OnDispatcherUnhandledException(object sender, DispatcherUnhandledExceptionEventArgs e)
     {

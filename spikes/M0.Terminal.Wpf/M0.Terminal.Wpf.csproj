@@ -58,6 +58,7 @@
   </Target>
   <ItemGroup>
     <None Include="cmux-prompt.ps1" CopyToOutputDirectory="PreserveNewest" />
+    <Resource Include="../../packaging/Assets/Cmux.ico" Link="Assets/Cmux.ico" />
     <Resource Include="Assets\sidebar-ornament-dual.png" />
   </ItemGroup>
 
