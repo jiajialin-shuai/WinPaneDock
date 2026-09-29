@@ -4,7 +4,13 @@ on:
   push:
   pull_request:
 
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
+
 jobs:
+  # Fast feedback. Cmux.Core has no native dependency, so this needs no
+  # terminal host and no desktop session.
   core:
     runs-on: windows-2022
     steps:
@@ -22,3 +28,53 @@ jobs:
           pwsh -NoProfile -File scripts/M3.Layout-Smoke.ps1 -Configuration Release
           pwsh -NoProfile -File scripts/M4.AgentDetection-Smoke.ps1 -Configuration Release
           pwsh -NoProfile -File scripts/M7.Git-Smoke.ps1 -Configuration Release
+
+  # The path a new contributor actually takes: a clean checkout, no pinned
+  # Windows Terminal version, no prebuilt output. The runner deliberately has
+  # no verified OpenConsole, so this fails if scripts/Copy-OpenConsole.ps1
+  # cannot resolve a terminal host on an arbitrary machine.
+  gui:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.425
+
+      - name: Install Windows Terminal for the ConPTY host
+        shell: pwsh
+        run: |
+          winget install --id Microsoft.WindowsTerminal -e --silent `
+            --accept-package-agreements --accept-source-agreements
+          # The build reads OpenConsole.exe from the installed package, so make
+          # the failure explicit rather than letting the build report it.
+          $found = Get-AppxPackage -Name Microsoft.WindowsTerminal
+          if (-not $found) { throw 'Windows Terminal was not registered after install.' }
+          Write-Host "Windows Terminal $($found.Version)"
+
+      - name: Verify OpenConsole resolves on a machine without the pinned version
+        shell: pwsh
+        run: |
+          $provenance = Join-Path $env:RUNNER_TEMP 'OpenConsole.provenance.txt'
+          pwsh -NoProfile -File scripts/Copy-OpenConsole.ps1 -Destination (Join-Path $env:RUNNER_TEMP 'OpenConsole.exe')
+          Get-Content $provenance
+
+      - name: Regression suite
+        shell: pwsh
+        run: pwsh -NoProfile -File scripts/Test.ps1 -Configuration Release
+
+      - name: Build MSIX package
+        shell: pwsh
+        run: pwsh -NoProfile -File scripts/M10.Build-Msix.ps1
+
+      - name: Show build metadata
+        shell: pwsh
+        run: Get-Content artifacts/msix-stage/build-metadata.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: winpanedock-msix
+          path: |
+            artifacts/*.msix
+            artifacts/msix-stage/build-metadata.txt
+          if-no-files-found: error
