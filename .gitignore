@@ -3,3 +3,7 @@
 /artifacts/
 /external/terminal/
 *.msix
+
+# OpenConsole.exe is a Microsoft Windows Terminal binary. It is copied in by
+# scripts/Copy-OpenConsole.ps1 at build time and must not be committed.
+packaging/.openconsole/
