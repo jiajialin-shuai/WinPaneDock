@@ -1,0 +1,51 @@
+# Third-Party Notices
+
+WinPaneDock redistributes the components listed below. Each retains its own
+copyright and license. WinPaneDock's own code is MIT licensed; see
+[LICENSE](LICENSE).
+
+## Microsoft Windows Terminal
+
+- `OpenConsole.exe`, the ConPTY console host used to run terminal sessions
+- `Microsoft.Terminal.Control.dll`, the renderer
+- `Microsoft.Terminal.Wpf.dll`, the WPF control host
+
+Copyright (c) Microsoft Corporation.
+
+Licensed under the MIT License. Source:
+<https://github.com/microsoft/terminal>
+
+`OpenConsole.exe` is **not committed to this repository**. It is copied from
+the Windows Terminal installation on the build machine by
+`scripts/Copy-OpenConsole.ps1` at build time.
+
+The WPF assemblies are consumed from the NuGet package
+`CI.Microsoft.Terminal.Wpf`. That package is a repackage of the upstream
+`src/cascadia/WpfTerminalControl` sources and carries no license expression or
+embedded license file of its own; the applicable terms are those of the
+upstream project linked above. The exact upstream commit used for a given
+build is recorded in `packaging/terminal-engine.json` and in the package
+`build-metadata.txt`.
+
+## .NET Runtime
+
+The MSIX is published self-contained and includes the .NET runtime
+(`coreclr.dll`, `System.*`, and related assemblies).
+
+Copyright (c) .NET Foundation and Contributors.
+
+Licensed under the MIT License. A portion of the runtime is redistributed
+under separate terms; the authoritative list is
+<https://github.com/dotnet/runtime/blob/main/THIRD-PARTY-NOTICES.txt>
+
+## CI.Microsoft.Terminal.Wpf
+
+Redistributed via NuGet under the terms of the upstream Windows Terminal
+project above. The package is produced by the "CI2Nuget Repackage Team" and
+declares no license of its own.
+
+## Notes for redistributors
+
+If you repackage WinPaneDock, keep this file and `LICENSE` together with any
+distribution. `OpenConsole.exe` remains subject to the Windows Terminal license
+regardless of how it was obtained.

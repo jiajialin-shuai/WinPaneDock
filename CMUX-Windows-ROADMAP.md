@@ -910,7 +910,9 @@ cmux list
 
 > 2026-09-24 状态：**部分完成**。GUI 强制结束后 SessionHost/Shell 继续运行，重新打开仍是同一 PID；Shell 自然退出后 Session 自动清理，Attach 客户端断开后输出订阅会释放。`cmux doctor` 必需项全通过；冷启动到窗口句柄 461ms，Workspace 切换 P95 73.5ms、Pane 聚焦 P95 90.1ms（含 CLI 启动），单字符 IPC 往返 P95 0.33ms。自包含 MSIX 已通过 MakeAppx 打包，并使用自签名开发证书在本机安装、启动和运行 CLI；正式发布者签名与键盘到渲染延迟验收尚未完成，见 `docs/M10-RELIABILITY.md`。
 
-> 2026-09-24 现役版本：**0.1.6.0 自签名开发包已在本机安装并启动**；Group 与 Split 默认启动所选 Profile，首次启动默认 PowerShell 7，显式关闭清除恢复命令，Night/Day/Gray 三主题与界面修正已包含。正式签名和完整键盘到渲染延迟验收仍待完成。运行态与发布证据见 `docs/M10-RELIABILITY.md`，界面限制见 `docs/M6-UI-POLISH.md`。
+> 2026-09-24 现役版本与运行证据以 [`docs/M10-RELIABILITY.md`](docs/M10-RELIABILITY.md) 为准，源码版本号以 `Directory.Build.props` 的 `CmuxAppVersion` 为唯一来源；本文件各段引用的版本号是当时测量的历史记录，不代表当前状态。Group 与 Split 默认启动所选 Profile，首次启动默认 PowerShell 7，显式关闭清除恢复命令，Night/Day/Gray 三主题与界面修正已包含。正式签名和完整键盘到渲染延迟验收仍待完成。界面限制见 `docs/M6-UI-POLISH.md`。
+
+> 2026-09-28 状态：**部分完成**。按 [`docs/OPTIMIZATION-REVIEW-2026-09-24.md`](docs/OPTIMIZATION-REVIEW-2026-09-24.md) 实施 O1–O12（详见该文第 7、8 节）。本轮修正并复核的可靠性缺陷：恢复期间焦点回退抛错导致 `_restoring` 卡死而布局永不落盘；延迟 Attach 绕过主题应用；关闭期间丢弃分支遗留已释放连接；`StopTransport` 关闭后误报渲染过慢；`Start()` 不等待在途准备；SessionHost 协议 0 可绕过 lease 栅栏（现仅 `identity`/`list` 放行）；`LayoutStore` 主文件缺失时无恢复提示。统一入口 `scripts/Test.ps1` 的桌面回归门已按 `-Configuration` 参数化，Debug 与 Release 均全绿。O9 第一步完成：8 套内置门迁至 `MainWindow.Smoke.cs`，`MainWindow.xaml.cs` 由 2196 行降至约 1899 行，9 个启动开关收敛为 `SmokeOptions`。源码/开发包版本升至 **0.1.6.4**，本机已注册并运行 **0.1.6.3**；0.1.6.4 尚未安装。仍待完成：安装版前后性能对比、O9 第二步、内置门 `--tab-smoke`/`--cwd-smoke`/`--palette-smoke` 的既有失败、正式分发签名与完整键盘到渲染延迟验收。
 
 必须完成：
 

@@ -35,6 +35,14 @@ Get-ChildItem -LiteralPath $stage -Recurse -File -Filter '*.pdb' | Remove-Item -
 $assets = Join-Path $stage 'Assets'
 New-Item -ItemType Directory -Path $assets | Out-Null
 Copy-Item -Path (Join-Path $root 'packaging\Assets\*.png') -Destination $assets
+# Ship the license and third-party notices inside the package so anyone who
+# redistributes the MSIX receives the required attributions.
+foreach ($notice in @('LICENSE', 'NOTICE')) {
+    $noticePath = Join-Path $root $notice
+    if (Test-Path -LiteralPath $noticePath) {
+        Copy-Item -LiteralPath $noticePath -Destination (Join-Path $stage $notice) -Force
+    }
+}
 $openConsoleHash = (Get-FileHash (Join-Path $stage 'OpenConsole.exe') -Algorithm SHA256).Hash
 $commit = (& git -C $root rev-parse HEAD 2>$null)
 $metadata = [System.Collections.Generic.List[string]]::new()
