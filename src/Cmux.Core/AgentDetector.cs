@@ -3,10 +3,30 @@ using System.Text.RegularExpressions;
 
 namespace Cmux.Core;
 
-public enum AgentType { Unknown, Codex, Claude, Grok, Gemini }
+public enum AgentType { Unknown, Codex, Claude, Grok, Gemini, OpenCode }
 public enum AgentDetectionSource { None, ProcessTree, LaunchCommand, TerminalTitle, Explicit }
 public sealed record AgentDetection(AgentType Type, AgentDetectionSource Source, int ProcessId);
 public sealed record AgentProcess(int ProcessId, int ParentProcessId, string Executable);
+
+public sealed class AgentProcessSnapshot
+{
+    private readonly Dictionary<int, List<AgentProcess>> _childrenByParent;
+    private readonly HashSet<int> _processIds;
+
+    public AgentProcessSnapshot(IReadOnlyList<AgentProcess> processes)
+    {
+        Processes = processes;
+        _processIds = processes.Select(process => process.ProcessId).ToHashSet();
+        _childrenByParent = processes
+            .GroupBy(process => process.ParentProcessId)
+            .ToDictionary(group => group.Key, group => group.ToList());
+    }
+
+    public IReadOnlyList<AgentProcess> Processes { get; }
+    public bool Contains(int processId) => _processIds.Contains(processId);
+    public IReadOnlyList<AgentProcess> ChildrenOf(int parentProcessId) =>
+        _childrenByParent.TryGetValue(parentProcessId, out var children) ? children : [];
+}
 
 public static class AgentDetector
 {
@@ -31,11 +51,15 @@ public static class AgentDetector
     }
 
     public static AgentDetection Detect(int rootPid, IReadOnlyList<AgentProcess> processes,
+        string launchCommand = "", string terminalTitle = "", AgentType explicitAgent = AgentType.Unknown) =>
+        Detect(rootPid, new AgentProcessSnapshot(processes), launchCommand, terminalTitle, explicitAgent);
+
+    public static AgentDetection Detect(int rootPid, AgentProcessSnapshot snapshot,
         string launchCommand = "", string terminalTitle = "", AgentType explicitAgent = AgentType.Unknown)
     {
         if (explicitAgent != AgentType.Unknown)
             return new AgentDetection(explicitAgent, AgentDetectionSource.Explicit, rootPid);
-        if (rootPid <= 0 || !processes.Any(p => p.ProcessId == rootPid))
+        if (rootPid <= 0 || !snapshot.Contains(rootPid))
             return new AgentDetection(AgentType.Unknown, AgentDetectionSource.None, 0);
 
         var descendants = new HashSet<int> { rootPid };
@@ -44,18 +68,19 @@ public static class AgentDetector
         while (pending.Count > 0)
         {
             var parent = pending.Dequeue();
-            foreach (var child in processes.Where(p => p.ParentProcessId == parent))
+            foreach (var child in snapshot.ChildrenOf(parent))
                 if (descendants.Add(child.ProcessId)) pending.Enqueue(child.ProcessId);
         }
 
-        foreach (var process in processes.Where(p => descendants.Contains(p.ProcessId)))
+        foreach (var process in snapshot.Processes)
         {
+            if (!descendants.Contains(process.ProcessId)) continue;
             var agent = NameToAgent(Path.GetFileNameWithoutExtension(process.Executable));
             if (agent != AgentType.Unknown)
                 return new AgentDetection(agent, AgentDetectionSource.ProcessTree, process.ProcessId);
         }
 
-        foreach (var agent in new[] { AgentType.Codex, AgentType.Claude, AgentType.Grok, AgentType.Gemini })
+        foreach (var agent in new[] { AgentType.Codex, AgentType.Claude, AgentType.Grok, AgentType.Gemini, AgentType.OpenCode })
         {
             if (Regex.IsMatch(launchCommand, $@"(?i)(?:^|[\s\""'\\]){agent}(?:\.exe|\.ps1)?(?:$|[\s\""'])"))
                 return new AgentDetection(agent, AgentDetectionSource.LaunchCommand, rootPid);
@@ -71,6 +96,7 @@ public static class AgentDetector
         "claude" => AgentType.Claude,
         "grok" => AgentType.Grok,
         "gemini" => AgentType.Gemini,
+        "opencode" => AgentType.OpenCode,
         _ => AgentType.Unknown,
     };
 

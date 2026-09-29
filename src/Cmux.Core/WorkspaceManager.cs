@@ -195,7 +195,7 @@ public sealed class WorkspaceManager
 
     public void Restore(LayoutSnapshot snapshot)
     {
-        if (snapshot.Version != 1) throw new ArgumentException("Unsupported layout version.");
+        LayoutValidator.Validate(snapshot);
         var restored = new List<Workspace>();
         foreach (var data in snapshot.Workspaces)
         {
