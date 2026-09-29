@@ -5,35 +5,49 @@ if ($PSVersionTable.PSEdition -ne 'Desktop') {
 }
 
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-$package = Join-Path $root 'artifacts\cmux-0.1.6.0-x64-dev.msix'
+$props = [xml](Get-Content -LiteralPath (Join-Path $root 'Directory.Build.props') -Raw)
+$version = [string]$props.Project.PropertyGroup.CmuxAppVersion
+$package = Join-Path $root "artifacts\WinPaneDock-$version-x64-dev.msix"
 if (-not (Test-Path -LiteralPath $package)) { throw "Package not found: $package" }
 
 $installed = Get-AppxPackage -Name Cmux.Windows | Select-Object -First 1
 if ($installed) {
     $hostPath = Join-Path $installed.InstallLocation 'Cmux.SessionHost.exe'
     if (Get-Process Cmux.Spike.Terminal -ErrorAction SilentlyContinue) {
-        throw 'Close all cmux windows before activating the update.'
+        throw 'Close all WinPaneDock windows before activating the update.'
     }
 
     $hostProcess = Get-Process Cmux.SessionHost -ErrorAction SilentlyContinue |
         Where-Object { $_.Path -eq $hostPath }
     if ($hostProcess) {
-        $pipeName = 'cmux-session-host-' + [Security.Principal.WindowsIdentity]::GetCurrent().User.Value.Replace('-', '_')
+        $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value.Replace('-', '_')
+        $pipeName = 'cmux-session-host-' + $sid
         $pipe = New-Object IO.Pipes.NamedPipeClientStream('.', $pipeName, [IO.Pipes.PipeDirection]::InOut)
+        $reader = $null
+        $writer = $null
         try {
             $pipe.Connect(3000)
             $writer = New-Object IO.StreamWriter($pipe)
             $writer.AutoFlush = $true
             $reader = New-Object IO.StreamReader($pipe)
-            $writer.WriteLine('{"Command":"list"}')
-            $response = $reader.ReadLine() | ConvertFrom-Json
+            $writer.WriteLine('{"Command":"list","ProtocolVersion":2}')
+            $task = $reader.ReadLineAsync()
+            if (-not $task.Wait(3000)) { throw 'Installed SessionHost did not respond.' }
+            $response = $task.Result | ConvertFrom-Json
             if (-not $response.Ok) { throw $response.Error }
+            if ($response.Identity -and $response.Identity.ProtocolVersion -ne 2) {
+                throw 'Installed SessionHost protocol is incompatible with this package.'
+            }
             $activeSessions = @($response.Sessions | Where-Object { $_ })
             if ($activeSessions.Count -gt 0) {
-                throw "Close the $($activeSessions.Count) active cmux terminals before updating."
+                throw "Close the $($activeSessions.Count) active WinPaneDock terminals before updating."
             }
         }
-        finally { $pipe.Dispose() }
+        finally {
+            try { if ($reader) { $reader.Dispose() } } catch { }
+            try { if ($writer) { $writer.Dispose() } } catch { }
+            try { $pipe.Dispose() } catch { }
+        }
         $hostProcess | Stop-Process
     }
 }

@@ -1,8 +1,10 @@
 $ErrorActionPreference = 'Stop'
 
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-$unsigned = Join-Path $root 'artifacts\cmux-0.1.6.0-x64-unsigned.msix'
-$signed = Join-Path $root 'artifacts\cmux-0.1.6.0-x64-dev.msix'
+$props = [xml](Get-Content -LiteralPath (Join-Path $root 'Directory.Build.props') -Raw)
+$version = [string]$props.Project.PropertyGroup.CmuxAppVersion
+$unsigned = Join-Path $root "artifacts\WinPaneDock-$version-x64-unsigned.msix"
+$signed = Join-Path $root "artifacts\WinPaneDock-$version-x64-dev.msix"
 $publicCert = Join-Path $root 'artifacts\cmux-dev.cer'
 $manifest = [xml](Get-Content -LiteralPath (Join-Path $root 'packaging\AppxManifest.xml') -Raw)
 $publisher = $manifest.Package.Identity.Publisher

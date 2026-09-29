@@ -1,23 +1,37 @@
+param([ValidateSet('Debug', 'Release')][string]$Configuration = 'Release')
 $ErrorActionPreference = 'Stop'
-$assembly = Join-Path $PSScriptRoot '../src/Cmux.Core/bin/Debug/net8.0/Cmux.Core.dll'
-Add-Type -Path (Resolve-Path $assembly)
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+$assembly = Join-Path $root "src/Cmux.Core/bin/$Configuration/net8.0/Cmux.Core.dll"
+$exe = Join-Path $root "spikes/M0.Terminal.Wpf/bin/$Configuration/net8.0-windows/Cmux.Spike.Terminal.exe"
+Add-Type -Path (Resolve-Path $assembly)
+$instanceId = "restore-smoke-$([guid]::NewGuid().ToString('N'))"
+$previousInstance = $env:CMUX_INSTANCE_ID
+$env:CMUX_INSTANCE_ID = $instanceId
+[Cmux.Core.InstanceScope]::Configure($instanceId)
+$pipeName = [Cmux.Core.InstanceScope]::Qualify(
+    'cmux-session-host-' + [Security.Principal.WindowsIdentity]::GetCurrent().User.Value.Replace('-', '_'))
 $path = Join-Path $env:TEMP ("cmux-app-restore-{0}.json" -f [guid]::NewGuid())
 $app = $null
-$pipeName = 'cmux-session-host-' + [Security.Principal.WindowsIdentity]::GetCurrent().User.Value.Replace('-', '_')
+$hostProcessId = $null
 $sessionIds = @()
-function Get-HostSessions {
+$leases = @{}
+
+function Send-HostRequest($request) {
     $pipe = [IO.Pipes.NamedPipeClientStream]::new('.', $pipeName, [IO.Pipes.PipeDirection]::InOut)
+    $reader = $null; $writer = $null
     try {
-        $pipe.Connect(5000)
-        $writer = [IO.StreamWriter]::new($pipe)
-        $writer.AutoFlush = $true
-        $reader = [IO.StreamReader]::new($pipe)
-        $writer.WriteLine('{"Command":"list"}')
-        return ($reader.ReadLine() | ConvertFrom-Json).Sessions
+        $pipe.Connect(5000); $writer = [IO.StreamWriter]::new($pipe); $writer.AutoFlush = $true; $reader = [IO.StreamReader]::new($pipe)
+        $writer.WriteLine(($request | ConvertTo-Json -Compress -Depth 8))
+        $task = $reader.ReadLineAsync(); if (-not $task.Wait(5000)) { throw 'SessionHost response timed out.' }
+        $response = $task.Result | ConvertFrom-Json; if (-not $response.Ok) { throw $response.Error }; return $response
     }
-    finally { $pipe.Dispose() }
+    finally {
+        try { if ($reader) { $reader.Dispose() } } catch { }
+        try { if ($writer) { $writer.Dispose() } } catch { }
+        try { $pipe.Dispose() } catch { }
+    }
 }
+
 try {
     $manager = [Cmux.Core.WorkspaceManager]::new()
     $default = $manager.Create('Default', $root)
@@ -33,38 +47,36 @@ try {
         'PowerShell', 'powershell.exe -NoLogo', $project.RootDirectory, 'PowerShell')
     $manager.TogglePin($project.Id)
     $manager.Select($default.Id)
-    $store = [Cmux.Core.LayoutStore]::new($path)
-    $store.Save($manager.Export())
+    [Cmux.Core.LayoutStore]::new($path).Save($manager.Export())
 
-    $exe = (Resolve-Path (Join-Path $root 'spikes/M0.Terminal.Wpf/bin/Debug/net8.0-windows/Cmux.Spike.Terminal.exe')).Path
-    $app = Start-Process -FilePath $exe -ArgumentList "--layout-path `"$path`"" -PassThru
-    Start-Sleep -Seconds 4
-    $sessionIds = @($left.SessionId.ToString(), $right.SessionId.ToString(), $projectTab.RootPane.SessionId.ToString())
-    $sessions = @(Get-HostSessions | Where-Object SessionId -in $sessionIds)
-    $shells = @($sessions | Where-Object { Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue })
-    if ($shells.Count -ne 3) {
-        throw "Restore launched $($shells.Count) live sessions; expected 3."
+    $arguments = "--layout-path `"$path`" --instance-id `"$instanceId`""
+    $app = Start-Process -FilePath $exe -ArgumentList $arguments -PassThru
+    Start-Sleep -Seconds 6
+    if ($app.HasExited) { throw "App exited early: $($app.ExitCode)" }
+    $identity = Send-HostRequest @{ Command = 'identity'; ProtocolVersion = 2 }
+    if ($identity.Identity.InstanceId -ne $instanceId -or
+        [IO.Path]::GetFullPath($identity.Identity.ExecutablePath) -ne [IO.Path]::GetFullPath((Join-Path $root "spikes/M0.Terminal.Wpf/bin/$Configuration/net8.0-windows/Cmux.SessionHost.exe"))) {
+        throw 'App did not use the expected isolated SessionHost.'
     }
-    & pwsh -NoProfile -File (Join-Path $PSScriptRoot 'M0.CaptureWindow.ps1') -Match 'cmux —' `
-        -Out (Join-Path $root 'artifacts/m3-restored-layout.png') -Mode PrintWindow | Out-Null
-    Write-Output 'App restore: 2 workspaces, 3 live SessionHost shells, split layout: PASS'
+    $hostProcessId = $identity.Identity.ProcessId
+    $sessionIds = @($left.SessionId.ToString(), $right.SessionId.ToString(), $projectTab.RootPane.SessionId.ToString())
+    $sessions = @( (Send-HostRequest @{ Command = 'list'; ProtocolVersion = 2 }).Sessions | Where-Object SessionId -in $sessionIds)
+    foreach ($session in $sessions) { $leases[$session.SessionId] = $session.LeaseId }
+    $shells = @($sessions | Where-Object { Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue })
+    if ($shells.Count -ne 3) { throw "Restore launched $($shells.Count) live sessions; expected 3." }
+    Write-Output 'App restore: 2 workspaces, 3 live isolated SessionHost shells, split layout: PASS'
 }
 finally {
     if ($app -and -not $app.HasExited) {
         $null = $app.CloseMainWindow()
-        if (-not $app.WaitForExit(3000)) { $app.Kill(); $app.WaitForExit() }
+        if (-not $app.WaitForExit(5000)) { Stop-Process -Id $app.Id -Force -ErrorAction SilentlyContinue; $app.WaitForExit() }
     }
     foreach ($id in $sessionIds) {
-        try {
-            $pipe = [IO.Pipes.NamedPipeClientStream]::new('.', $pipeName, [IO.Pipes.PipeDirection]::InOut)
-            $pipe.Connect(1000)
-            $writer = [IO.StreamWriter]::new($pipe)
-            $writer.AutoFlush = $true
-            $writer.WriteLine((@{ Command = 'close'; SessionId = $id } | ConvertTo-Json -Compress))
-            $pipe.Dispose()
-        } catch { }
+        try { Send-HostRequest @{ Command = 'close'; ProtocolVersion = 2; SessionId = $id; LeaseId = $leases[$id] } | Out-Null } catch { }
     }
+    if ($hostProcessId) { Stop-Process -Id $hostProcessId -Force -ErrorAction SilentlyContinue }
     foreach ($file in @($path, "$path.bak", "$path.tmp", "$path.bak.tmp")) {
         Remove-Item -LiteralPath $file -ErrorAction SilentlyContinue
     }
+    if ($null -eq $previousInstance) { Remove-Item Env:CMUX_INSTANCE_ID -ErrorAction SilentlyContinue } else { $env:CMUX_INSTANCE_ID = $previousInstance }
 }

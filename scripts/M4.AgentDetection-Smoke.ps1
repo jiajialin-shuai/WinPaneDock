@@ -1,7 +1,8 @@
+param([ValidateSet('Debug', 'Release')][string]$Configuration = 'Release')
 $ErrorActionPreference = 'Stop'
-$assembly = Join-Path $PSScriptRoot '../src/Cmux.Core/bin/Debug/net8.0/Cmux.Core.dll'
+$assembly = Join-Path $PSScriptRoot "../src/Cmux.Core/bin/$Configuration/net8.0/Cmux.Core.dll"
 Add-Type -Path (Resolve-Path $assembly)
-$agents = @('Codex','Claude','Grok','Gemini')
+$agents = @('Codex','Claude','Grok','Gemini','OpenCode')
 foreach ($name in $agents) {
     $processes = [Cmux.Core.AgentProcess[]]@(
         [Cmux.Core.AgentProcess]::new(100, 0, 'pwsh.exe'),

@@ -1,3 +1,4 @@
+param([ValidateSet('Debug', 'Release')][string]$Configuration = 'Release')
 $ErrorActionPreference = 'Stop'
 $root = Join-Path $env:TEMP ('cmux-git-' + [guid]::NewGuid().ToString('N'))
 $resolved = [IO.Path]::GetFullPath($root)
@@ -9,7 +10,7 @@ try {
     Set-Content -LiteralPath (Join-Path $root 'readme.txt') -Value 'initial'
     git -C $root add readme.txt
     git -C $root -c user.name=cmux-test -c user.email=cmux@example.invalid commit -qm initial
-    Add-Type -Path (Join-Path $PSScriptRoot '..\src\Cmux.Core\bin\Debug\net8.0\Cmux.Core.dll')
+    Add-Type -Path (Join-Path $PSScriptRoot "..\src\Cmux.Core\bin\$Configuration\net8.0\Cmux.Core.dll")
     $clean = [Cmux.Core.GitProjectContext]::ReadAsync($root).GetAwaiter().GetResult()
     if ($clean.Branch -ne 'main' -or $clean.IsDirty) { throw "Clean status was $clean" }
     Add-Content -LiteralPath (Join-Path $root 'readme.txt') -Value 'changed'
