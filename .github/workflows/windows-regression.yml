@@ -1,0 +1,24 @@
+name: windows-regression
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  core:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.425
+      - name: Build Core
+        shell: pwsh
+        run: dotnet build src/Cmux.Core/Cmux.Core.csproj -c Release --nologo
+      - name: Run Core smoke checks
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File scripts/M2.Workspace-Smoke.ps1 -Configuration Release
+          pwsh -NoProfile -File scripts/M3.Layout-Smoke.ps1 -Configuration Release
+          pwsh -NoProfile -File scripts/M4.AgentDetection-Smoke.ps1 -Configuration Release
+          pwsh -NoProfile -File scripts/M7.Git-Smoke.ps1 -Configuration Release
