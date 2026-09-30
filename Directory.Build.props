@@ -1,6 +1,6 @@
 <Project>
   <PropertyGroup>
-    <CmuxAppVersion>0.1.6.7</CmuxAppVersion>
+    <CmuxAppVersion>0.1.6.8</CmuxAppVersion>
     <Version>$(CmuxAppVersion)</Version>
     <AssemblyVersion>$(CmuxAppVersion)</AssemblyVersion>
     <FileVersion>$(CmuxAppVersion)</FileVersion>
