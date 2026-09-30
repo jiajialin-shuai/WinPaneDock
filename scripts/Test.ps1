@@ -62,6 +62,10 @@ if ($Configuration -eq 'Release') {
         & pwsh -NoProfile -File (Join-Path $root 'scripts/M5.Output-Framing-Smoke.ps1')
         if ($LASTEXITCODE -ne 0) { throw 'M5 framing smoke failed' }
     }
+    Invoke-Check 'output frame reader' {
+        & pwsh -NoProfile -File (Join-Path $root 'scripts/M5.Frame-Reader-Smoke.ps1')
+        if ($LASTEXITCODE -ne 0) { throw 'M5 frame reader smoke failed' }
+    }
     Invoke-Check 'explicit close persistence' {
         & pwsh -NoProfile -File (Join-Path $root 'scripts/M5.Close-Persist-Smoke.ps1')
         if ($LASTEXITCODE -ne 0) { throw 'M5 close persistence smoke failed' }

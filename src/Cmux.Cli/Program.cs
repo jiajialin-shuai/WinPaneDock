@@ -44,8 +44,9 @@ if (gui is not null)
         using var guiWriter = new StreamWriter(guiPipe, leaveOpen: true) { AutoFlush = true };
         using var guiReader = new StreamReader(guiPipe, leaveOpen: true);
         await NamedPipeProtocol.WriteLineAsync(guiWriter, JsonSerializer.Serialize(gui), requestDeadline.Token);
+        var guiReplies = new NamedPipeLineReader(guiReader, 256 * 1024);
         var reply = JsonSerializer.Deserialize<GuiCommandResponse>(
-            await NamedPipeProtocol.ReadLineAsync(guiReader, 256 * 1024, requestDeadline.Token) ?? "");
+            await guiReplies.ReadLineAsync(requestDeadline.Token) ?? "");
         if (reply is null || !reply.Ok)
         {
             diagnostics.Value.Write(DiagnosticLevel.Warning, "cli.gui-command.failed", $"command={gui.Command}");
@@ -95,7 +96,8 @@ try
     options.Converters.Add(new JsonStringEnumConverter());
     await NamedPipeProtocol.WriteLineAsync(writer, JsonSerializer.Serialize(new AgentEvent(workspaceId, paneId, sessionId,
         notify ? parsedStatus : AgentStatus.Unknown, cwd ? Path.GetFullPath(args[1]) : null), options), requestDeadline.Token);
-    var reply = await NamedPipeProtocol.ReadLineAsync(reader, 256 * 1024, requestDeadline.Token);
+    var replies = new NamedPipeLineReader(reader, 256 * 1024);
+    var reply = await replies.ReadLineAsync(requestDeadline.Token);
     if (reply == "OK") return 0;
     diagnostics.Value.Write(DiagnosticLevel.Warning, "cli.notification.rejected");
     Console.Error.WriteLine(reply ?? "cmux did not acknowledge the event.");

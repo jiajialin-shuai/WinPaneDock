@@ -75,7 +75,7 @@ public sealed class ConptyConnection : ITerminalConnection, IDisposable
     private readonly CancellationTokenSource _requestStop = new();
     private readonly SemaphoreSlim _lifecycleGate = new(1, 1);
     private NamedPipeClientStream? _pipe;
-    private StreamReader? _pendingOutputReader;
+    private Cmux.Core.NamedPipeLineReader? _pendingOutputReader;
     private string? _pendingReplay;
     private Task? _requestPump;
     private Task? _outputPump;
@@ -195,7 +195,7 @@ public sealed class ConptyConnection : ITerminalConnection, IDisposable
             SessionHostClient.RequireCompatibleIdentity(attached.Response,
                 Path.Combine(AppContext.BaseDirectory, "Cmux.SessionHost.exe"));
             _pipe = attached.Pipe;
-            _pendingOutputReader = attached.Reader;
+            _pendingOutputReader = attached.Frames;
             _pendingReplay = string.IsNullOrEmpty(attached.Response.Replay) ? null
                 : FilterReplay(attached.Response.Replay);
             StartPumps();
@@ -335,16 +335,16 @@ public sealed class ConptyConnection : ITerminalConnection, IDisposable
     private async Task ReadOutputAsync()
     {
         var stop = OutputPumpStop.Completed;
-        var frames = 0L;
+        var frameCount = 0L;
         try
         {
             while (true)
             {
                 var reader = Interlocked.Exchange(ref _pendingOutputReader, null);
                 if (reader is null) { stop = OutputPumpStop.Completed; break; }
-                var outcome = await PumpFramesAsync(reader, frames).ConfigureAwait(false);
+                var outcome = await PumpFramesAsync(reader, frameCount).ConfigureAwait(false);
                 stop = outcome.Stop;
-                frames = outcome.Frames;
+                frameCount = outcome.Frames;
                 TryDispose(reader);
                 if (stop != OutputPumpStop.Reattachable) break;
                 if (!await TryReattachOutputAsync().ConfigureAwait(false))
@@ -367,13 +367,16 @@ public sealed class ConptyConnection : ITerminalConnection, IDisposable
     /// Reads frames from one attach pipe until it stops. Returns why it stopped so the
     /// caller can decide between giving up and reattaching.
     /// </summary>
-    private async Task<(OutputPumpStop Stop, long Frames)> PumpFramesAsync(StreamReader reader, long frames)
+    private async Task<(OutputPumpStop Stop, long Frames)> PumpFramesAsync(
+        Cmux.Core.NamedPipeLineReader frames, long frameCount)
     {
         string? offending = null;
+        // The reader is the one the attach produced, so the first output frames that shared
+        // a read with the attach response are still pending inside it. A reader built here
+        // would start from the middle of that carry and desynchronise the stream.
         try
         {
-            while (await Cmux.Core.NamedPipeProtocol.ReadLineAsync(reader, 8 * 1024 * 1024,
-                CancellationToken.None) is { } line)
+            while (await frames.ReadLineAsync(CancellationToken.None) is { } line)
             {
                 HostResponse? response;
                 try { response = JsonSerializer.Deserialize<HostResponse>(line, JsonOptions); }
@@ -384,13 +387,13 @@ public sealed class ConptyConnection : ITerminalConnection, IDisposable
                     // evidence that distinguishes a lost tail from a desynchronised stream.
                     offending = line;
                     App.Diagnostics.Write(DiagnosticLevel.Error, "terminal.output.malformed",
-                        $"sessionId={_sessionId} frames={frames} chars={line.Length} " +
+                        $"sessionId={_sessionId} frames={frameCount} chars={line.Length} " +
                         $"head={SummarizeForLog(line)} reason={ex.Message}");
-                    return (OutputPumpStop.Reattachable, frames);
+                    return (OutputPumpStop.Reattachable, frameCount);
                 }
                 if (response?.Event == "output" && response.Output is { } data)
                 {
-                    frames++;
+                    frameCount++;
                     Volatile.Write(ref _lastOutputTick, Environment.TickCount64);
                     QueueOutput(data);
                 }
@@ -398,29 +401,31 @@ public sealed class ConptyConnection : ITerminalConnection, IDisposable
                 {
                     var error = response.Error ?? "SessionHost disconnected the output stream.";
                     App.Diagnostics.Write(DiagnosticLevel.Warning, "terminal.output.refused",
-                        $"sessionId={_sessionId} frames={frames} error={error}");
-                    return (IsPermanentAttachFailure(error) ? OutputPumpStop.Permanent : OutputPumpStop.Reattachable, frames);
+                        $"sessionId={_sessionId} frames={frameCount} error={error}");
+                    return (IsPermanentAttachFailure(error) ? OutputPumpStop.Permanent : OutputPumpStop.Reattachable, frameCount);
                 }
             }
             // A clean end of stream: the host tore the attach down (write deadline, or the
             // client side went away). Reattaching is correct because the session is durable.
-            return (OutputPumpStop.Reattachable, frames);
+            return (OutputPumpStop.Reattachable, frameCount);
         }
         catch (IOException ex)
         {
-            if (_detached || Volatile.Read(ref _closed) != 0) return (OutputPumpStop.Completed, frames);
+            if (_detached || Volatile.Read(ref _closed) != 0) return (OutputPumpStop.Completed, frameCount);
             App.Diagnostics.Write(DiagnosticLevel.Warning, "terminal.output.io",
-                $"sessionId={_sessionId} frames={frames} error={ex.GetType().Name}: {ex.Message}");
-            return (OutputPumpStop.Reattachable, frames);
+                $"sessionId={_sessionId} frames={frameCount} error={ex.GetType().Name}: {ex.Message}");
+            return (OutputPumpStop.Reattachable, frameCount);
         }
-        catch (ObjectDisposedException) { return (OutputPumpStop.Completed, frames); }
+        catch (ObjectDisposedException) { return (OutputPumpStop.Completed, frameCount); }
         catch (InvalidDataException ex)
         {
-            // A single frame exceeded the reader limit, so the rest of it stays in the pipe.
-            if (_detached || Volatile.Read(ref _closed) != 0) return (OutputPumpStop.Completed, frames);
+            // A single frame exceeded the reader limit. The reader has already stepped past
+            // it, so the frames behind it are still intact, but the safest response to a
+            // frame this far out of shape is to rebuild the pipe.
+            if (_detached || Volatile.Read(ref _closed) != 0) return (OutputPumpStop.Completed, frameCount);
             App.Diagnostics.Write(DiagnosticLevel.Error, "terminal.output.oversize",
-                $"sessionId={_sessionId} frames={frames} error={ex.Message}");
-            return (OutputPumpStop.Reattachable, frames);
+                $"sessionId={_sessionId} frames={frameCount} error={ex.Message}");
+            return (OutputPumpStop.Reattachable, frameCount);
         }
     }
 
@@ -454,7 +459,7 @@ public sealed class ConptyConnection : ITerminalConnection, IDisposable
             // alive on the host and let it fail its write deadline again.
             DisposePipe();
             _pipe = attached.Pipe;
-            _pendingOutputReader = attached.Reader;
+            _pendingOutputReader = attached.Frames;
             Interlocked.Exchange(ref _attached, 1);
             var replayRaw = attached.Response.Replay;
             var replay = string.IsNullOrEmpty(replayRaw) ? null : FilterReplay(replayRaw);

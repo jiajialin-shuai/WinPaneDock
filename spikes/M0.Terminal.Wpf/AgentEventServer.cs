@@ -32,8 +32,8 @@ public sealed class AgentEventServer(Func<AgentEvent, bool> handleEvent) : IDisp
                 using var writer = new StreamWriter(pipe, leaveOpen: true) { AutoFlush = true };
                 using var deadline = CancellationTokenSource.CreateLinkedTokenSource(_stop.Token);
                 deadline.CancelAfter(NamedPipeProtocol.DefaultRequestTimeoutMs);
-                var line = await NamedPipeProtocol.ReadLineAsync(reader, NamedPipeProtocol.MaxRequestChars,
-                    deadline.Token);
+                var requests = new NamedPipeLineReader(reader, NamedPipeProtocol.MaxRequestChars);
+                var line = await requests.ReadLineAsync(deadline.Token);
                 var agentEvent = line is null ? null : JsonSerializer.Deserialize<AgentEvent>(line, JsonOptions);
                 var accepted = agentEvent is not null && handleEvent(agentEvent);
                 await NamedPipeProtocol.WriteLineAsync(writer,

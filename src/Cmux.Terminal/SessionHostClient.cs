@@ -26,11 +26,11 @@ public static class SessionHostClient
             pipe = await ConnectAsync(deadline.Token).ConfigureAwait(false);
             writer = new StreamWriter(pipe, leaveOpen: true) { AutoFlush = true };
             reader = new StreamReader(pipe, leaveOpen: true);
+            var frames = new Cmux.Core.NamedPipeLineReader(reader, MaxResponseChars);
             var payload = JsonSerializer.Serialize(request with { ProtocolVersion = SessionHostProtocol.ProtocolVersion }, JsonOptions);
             await Cmux.Core.NamedPipeProtocol.WriteLineAsync(writer, payload, deadline.Token)
                 .ConfigureAwait(false);
-            var line = await Cmux.Core.NamedPipeProtocol.ReadLineAsync(reader, MaxResponseChars, deadline.Token)
-                .ConfigureAwait(false);
+            var line = await frames.ReadLineAsync(deadline.Token).ConfigureAwait(false);
             return ParseResponse(line);
         }
         catch (OperationCanceledException ex) when (!cancellationToken.IsCancellationRequested)
@@ -45,12 +45,15 @@ public static class SessionHostClient
         }
     }
 
-    public static (NamedPipeClientStream Pipe, StreamReader Reader, HostResponse Response) Attach(
+    public static (NamedPipeClientStream Pipe, Cmux.Core.NamedPipeLineReader Frames, HostResponse Response) Attach(
         string sessionId, int timeoutMs = 5000, string? leaseId = null,
         bool includeReplay = true, int replayLimit = 0) =>
         AttachAsync(sessionId, timeoutMs, leaseId, includeReplay, replayLimit).GetAwaiter().GetResult();
 
-    public static async Task<(NamedPipeClientStream Pipe, StreamReader Reader, HostResponse Response)> AttachAsync(
+    // The attach response and the first output frames can arrive in a single read, so the
+    // frame reader that parsed the response is handed on rather than the bare stream: the
+    // caller's output pump continues from the carry instead of starting mid-frame.
+    public static async Task<(NamedPipeClientStream Pipe, Cmux.Core.NamedPipeLineReader Frames, HostResponse Response)> AttachAsync(
         string sessionId, int timeoutMs = 5000, string? leaseId = null,
         bool includeReplay = true, int replayLimit = 0,
         CancellationToken cancellationToken = default)
@@ -59,7 +62,7 @@ public static class SessionHostClient
         using var deadline = CreateDeadline(timeoutMs, cancellationToken);
         var pipe = await ConnectAsync(deadline.Token).ConfigureAwait(false);
         StreamWriter? writer = null;
-        StreamReader? reader = null;
+        Cmux.Core.NamedPipeLineReader? frames = null;
         try
         {
             writer = new StreamWriter(pipe, leaveOpen: true) { AutoFlush = true };
@@ -70,23 +73,22 @@ public static class SessionHostClient
                 .ConfigureAwait(false);
             TryDispose(writer);
             writer = null;
-            reader = new StreamReader(pipe, leaveOpen: true);
-            var line = await Cmux.Core.NamedPipeProtocol.ReadLineAsync(reader, MaxResponseChars, deadline.Token)
-                .ConfigureAwait(false);
+            frames = new Cmux.Core.NamedPipeLineReader(new StreamReader(pipe, leaveOpen: true), MaxResponseChars);
+            var line = await frames.ReadLineAsync(deadline.Token).ConfigureAwait(false);
             var response = ParseResponse(line);
-            var result = (pipe, reader, response);
-            reader = null;
+            var result = (pipe, frames, response);
+            frames = null;
             return result;
         }
         catch (OperationCanceledException ex) when (!cancellationToken.IsCancellationRequested)
         {
-            TryDispose(reader);
+            TryDispose(frames);
             TryDispose(pipe);
             throw new TimeoutException("SessionHost attach deadline exceeded.", ex);
         }
         catch
         {
-            TryDispose(reader);
+            TryDispose(frames);
             TryDispose(pipe);
             throw;
         }

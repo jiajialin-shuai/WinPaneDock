@@ -17,6 +17,7 @@ dotnet build spikes/M0.Terminal.Wpf/M0.Terminal.Wpf.csproj -c Release
 pwsh -NoProfile -File scripts/M5.SessionHost-Smoke.ps1
 pwsh -NoProfile -File scripts/M5.Output-Backpressure-Smoke.ps1
 pwsh -NoProfile -File scripts/M5.Output-Framing-Smoke.ps1
+pwsh -NoProfile -File scripts/M5.Frame-Reader-Smoke.ps1
 pwsh -NoProfile -File scripts/M5.Ipc-Deadline-Smoke.ps1
 pwsh -NoProfile -File scripts/M5.Lease-Fence-Smoke.ps1
 pwsh -NoProfile -File scripts/M5.Input-Chunk-Smoke.ps1
@@ -33,6 +34,12 @@ pwsh -NoProfile -File scripts/M10.Reattach-Smoke.ps1
 
 启动首屏会补发。`TerminalContainer` 在原生终端窗口建好之前到达的输出一律丢弃（`Connection_TerminalOutput` 里先比 `IntPtr.Zero` 再决定要不要 `TerminalSendOutput`），而新建 Pane 的控件在第一次布局前并没有这个窗口。grok、opencode 这类只画一次就静默的 TUI 因此整屏不可见，直到用户碰巧触发重绘（比如 split 改变尺寸）。`ConptyConnection` 现在保留最近 512 KiB 输出尾巴，绑定连接时若控件尚未 `IsLoaded` 就打标记，`Loaded` 之后以 `ApplicationIdle` 优先级补发一次（`terminal.output.replayed`）。绑定逻辑收敛到 `AttachControlConnection`，`Boot`、`FocusPane` 和门都用同一条路径。`scripts/M10.Replay-Smoke.ps1` 强制复现这个时序（不等任何 dispatcher 轮次就绑定），并校验补发确实发生。
 
-坏帧仍然会发生（`terminal.output.malformed`），根因未定位：坏行以完整行到达但起点不在帧边界（`BytePositionInLine` 0/1/107），是读指针错位而非尾部截断。现在错误日志带原始行前 96 字符的转义摘要、帧计数和行长度；0.1.6.6 实测样例为 `frames=13 chars=9366 head=500\u2500\u2500...`，即读指针落进了 JSON 数字中间。配合宿主的 `session.output.metrics` 与客户端的 `terminal.output.metrics` 可直接比对批次与字符数，判断丢帧还是重帧。`scripts/M10.Reattach-Smoke.ps1` 用 `--reattach-smoke` 门主动丢弃 attach 管道，要求同一 shell 上输出恢复。
+坏帧的根因已定位并修复（`terminal.output.malformed`）。症状是坏行以完整行到达但起点不在帧边界（`BytePositionInLine` 0/1/3），即读指针错位而非尾部截断。根因在 `NamedPipeProtocol.ReadLineAsync`：它一读到换行符就返回，并把同一次读取中该字符之后已经读进缓冲区的字节直接丢弃。一次读取会填满整个缓冲区，因此只要一次读取跨过帧边界，下一帧的开头就没了，流随即错位，之后每一帧都从负载中间开始，`JsonSerializer.Deserialize` 必然抛 `JsonException`。每个坏帧都会触发一次重连，6 次预算耗尽后 Pane 永久卡死，只能重启该终端。
+
+读取逻辑改为 `Cmux.Core.NamedPipeLineReader`：它持有跨调用的 carry，帧边界之后的剩余字节留给下一次调用；一个 reader 对应一个 `StreamReader`。超过 `maxChars` 的帧在消费掉其终止符之后才抛 `InvalidDataException`，这样调用方若选择继续读，不会永远卡在同一帧上。
+
+原有的 `scripts/M5.Output-Framing-Smoke.ps1` 抓不到这个 bug：它用 `StreamReader.ReadLineAsync` 读 attach 流，而后者自带缓冲、按构造就是正确的，它证明的是宿主写出的帧合法，不是 cmux 读回来时仍然对齐。新增 `scripts/M5.Frame-Reader-Smoke.ps1` 驱动 cmux 实际使用的读取器：帧由独立进程写入管道（与真实拓扑一致，因为超过管道缓冲的负载会让写端阻塞到读端排空），覆盖一次读取含多帧、跨多次读取的大帧、CRLF、无终止符尾帧、引号/花括号/反斜杠、超长帧后的恢复，以及 4000 帧突发的完整有序。该用例已纳入 `scripts/Test.ps1` 的 `output frame reader`。实测旧读取器在 4000 帧突发中只能读回 49 帧，新读取器读回全部 4000 帧。
+
+`terminal.output.malformed` 的错误日志仍带原始行前 96 字符的转义摘要、帧计数和行长度；配合宿主的 `session.output.metrics` 与客户端的 `terminal.output.metrics` 可直接比对批次与字符数，判断丢帧还是重帧。`scripts/M10.Reattach-Smoke.ps1` 用 `--reattach-smoke` 门主动丢弃 attach 管道，要求同一 shell 上输出恢复。
 
 已知限制：每个 Session 缓存最多 100 万字符，长时间运行后重连只重放尾部输出，无法保证完整恢复复杂 TUI 屏幕。SessionHost 是当前用户单实例，目前没有宿主崩溃自动恢复；宿主进程死亡时客户端重连会连续失败并最终停用该 Pane，需要重开。`Boot()` 里的 `Terminal.Connection` setter 会在 UI 线程上同步 `GetAwaiter().GetResult()` 等待 Attach，Attach 变慢时界面会短暂无响应，待单独立项。

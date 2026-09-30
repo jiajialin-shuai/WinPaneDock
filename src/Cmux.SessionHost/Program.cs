@@ -67,10 +67,10 @@ async Task HandleClientAsync(NamedPipeServerStream pipe)
         try
         {
             string? line;
+            var requests = new NamedPipeLineReader(reader, NamedPipeProtocol.MaxRequestChars);
             using (var requestDeadline = new CancellationTokenSource(NamedPipeProtocol.DefaultRequestTimeoutMs))
             {
-                line = await NamedPipeProtocol.ReadLineAsync(reader, NamedPipeProtocol.MaxRequestChars,
-                    requestDeadline.Token);
+                line = await requests.ReadLineAsync(requestDeadline.Token);
             }
             request = line is null ? null : JsonSerializer.Deserialize<HostRequest>(line, jsonOptions);
             if (request is null) return;

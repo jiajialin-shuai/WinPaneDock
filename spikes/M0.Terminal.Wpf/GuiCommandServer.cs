@@ -26,8 +26,8 @@ public sealed class GuiCommandServer(Func<GuiCommandRequest, GuiCommandResponse>
                 using var writer = new StreamWriter(pipe, leaveOpen: true) { AutoFlush = true };
                 using var deadline = CancellationTokenSource.CreateLinkedTokenSource(_stop.Token);
                 deadline.CancelAfter(NamedPipeProtocol.DefaultRequestTimeoutMs);
-                var line = await NamedPipeProtocol.ReadLineAsync(reader, NamedPipeProtocol.MaxRequestChars,
-                    deadline.Token);
+                var requests = new NamedPipeLineReader(reader, NamedPipeProtocol.MaxRequestChars);
+                var line = await requests.ReadLineAsync(deadline.Token);
                 GuiCommandResponse response;
                 try
                 {
