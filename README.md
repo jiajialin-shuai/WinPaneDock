@@ -49,6 +49,15 @@ Windows 桌面终端工作区管理器。WPF 界面嵌入官方 Windows Terminal
 winget install --id Microsoft.WindowsTerminal
 ```
 
+也可以不装：直接从官方 Release 下载便携版并解压出 `OpenConsole.exe`，无需包管理器和管理员权限。CI 用的就是这条路（GitHub 的 windows-2022 runner 既没有 Windows Terminal 也没有 winget）：
+
+```powershell
+pwsh -NoProfile -File scripts/Get-OpenConsoleFromRelease.ps1 -Destination <路径>\OpenConsole.exe
+$env:CMUX_OPENCONSOLE_PATH = '<路径>\OpenConsole.exe'
+```
+
+版本和校验值都取自 `packaging/terminal-engine.json`，哈希不符会直接失败并删除下载的文件。
+
 ## 从源码构建
 
 ### 最快路径：只看一眼效果

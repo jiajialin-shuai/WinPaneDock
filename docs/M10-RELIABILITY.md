@@ -8,6 +8,8 @@
 
 `OpenConsole.exe` 在构建时由 `scripts/Copy-OpenConsole.ps1` 解析，来源依次为：显式路径（`-OpenConsolePath` 或 `CMUX_OPENCONSOLE_PATH`）、`packaging/.openconsole` 缓存、本机已安装的最新 Windows Terminal 包。与 `packaging/terminal-engine.json` 记录的参考组合不一致时给出警告并继续构建，实际使用的来源与 SHA-256 会写入包内 `build-metadata.txt`；需要严格可复现的发布构建时传 `-RequireReferenceBuild`。缺少 OpenConsole 时的错误信息会直接给出安装与覆盖方式。
 
+机器上没有 Windows Terminal 时，`scripts/Get-OpenConsoleFromRelease.ps1` 可从官方 Release 下载便携版 x64 zip 并解压出 `OpenConsole.exe`，绕开包管理器、管理员权限和 AppX 注册。CI 走的就是这条路：GitHub 的 windows-2022 镜像既没有 Windows Terminal 也没有 winget，原先的 `winget install` 步骤必然以 `The term 'winget' is not recognized` 失败，并连带跳过整个回归套件。zip 里的 `OpenConsole.exe` 与 msix 安装的逐字节一致，因此 CI 与本机解析到的是同一个引擎。版本与期望哈希均取自 `packaging/terminal-engine.json`，哈希不符时脚本失败并删除下载的文件——文件来自网络，"下载成功"本身不能证明它就是项目固定的那个二进制。
+
 ## 会话与恢复
 
 正常关闭 GUI 会 Detach，SessionHost 和 Shell 继续运行；显式关闭 Terminal、Group 或 Workspace 才结束对应 Shell。显式关闭还会清除布局中的启动命令，重开应用不会复活已关闭的会话。`Close All Terminals` 立即保存空终端布局，并保留 Workspace、Group 和空 Pane。强制结束 GUI 后可按持久化 SessionId 重连；Shell 自然退出后，SessionHost 延迟清理 Session 与 ConPTY 句柄。

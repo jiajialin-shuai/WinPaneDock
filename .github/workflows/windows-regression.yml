@@ -31,7 +31,7 @@ jobs:
 
   # The path a new contributor actually takes: a clean checkout, no pinned
   # Windows Terminal version, no prebuilt output. The runner deliberately has
-  # no verified OpenConsole, so this fails if scripts/Copy-OpenConsole.ps1
+  # no Windows Terminal installed, so this fails if scripts/Copy-OpenConsole.ps1
   # cannot resolve a terminal host on an arbitrary machine.
   gui:
     runs-on: windows-2022
@@ -41,23 +41,26 @@ jobs:
         with:
           dotnet-version: 8.0.425
 
-      - name: Install Windows Terminal for the ConPTY host
+      # The windows-2022 image has neither Windows Terminal nor winget, so the previous
+      # `winget install` step could never run: it failed with "The term 'winget' is not
+      # recognized", which skipped the entire regression suite. The portable x64 zip on
+      # the release page ships the same OpenConsole.exe the msix installs, so the terminal
+      # host is fetched directly, with no package manager and no AppX registration.
+      - name: Fetch the pinned OpenConsole host
         shell: pwsh
         run: |
-          winget install --id Microsoft.WindowsTerminal -e --silent `
-            --accept-package-agreements --accept-source-agreements
-          # The build reads OpenConsole.exe from the installed package, so make
-          # the failure explicit rather than letting the build report it.
-          $found = Get-AppxPackage -Name Microsoft.WindowsTerminal
-          if (-not $found) { throw 'Windows Terminal was not registered after install.' }
-          Write-Host "Windows Terminal $($found.Version)"
+          $destination = Join-Path $env:RUNNER_TEMP 'OpenConsole.exe'
+          pwsh -NoProfile -File scripts/Get-OpenConsoleFromRelease.ps1 -Destination $destination
+          # Every later step resolves the host through this variable, including the
+          # csproj Exec call, which passes no switches of its own.
+          "CMUX_OPENCONSOLE_PATH=$destination" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Verify OpenConsole resolves on a machine without the pinned version
         shell: pwsh
         run: |
-          $provenance = Join-Path $env:RUNNER_TEMP 'OpenConsole.provenance.txt'
-          pwsh -NoProfile -File scripts/Copy-OpenConsole.ps1 -Destination (Join-Path $env:RUNNER_TEMP 'OpenConsole.exe')
-          Get-Content $provenance
+          $destination = Join-Path $env:RUNNER_TEMP 'OpenConsole.resolved.exe'
+          pwsh -NoProfile -File scripts/Copy-OpenConsole.ps1 -Destination $destination -RequireReferenceBuild
+          Get-Content "$destination.provenance.txt"
 
       - name: Regression suite
         shell: pwsh
