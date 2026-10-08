@@ -1,6 +1,11 @@
 param(
     [string] $Zip = (Join-Path (Resolve-Path (Join-Path $PSScriptRoot '..')).Path 'artifacts\WinPaneDock-0.1.6.8-x64-portable.zip'),
-    [int] $TimeoutSeconds = 180
+    [int] $TimeoutSeconds = 180,
+    # Skips the GUI launch. The runner has no desktop session, and TerminalControl's
+    # HwndHost needs a real window station, so the launch half only runs locally.
+    # With -SkipLaunch the layout, hash and provenance checks still run, which is
+    # what actually guards against a bundle that cannot start.
+    [switch] $SkipLaunch
 )
 
 # Proves the portable bundle works from a clean unzip, the way a recipient
@@ -92,6 +97,12 @@ try {
     # Confirm the SessionHost pipe is genuinely free BEFORE launching, so a
     # later "connected" result cannot be attributed to an installed version.
     if (Get-IsolatedHostId) { throw 'An isolated SessionHost was already running; instance id collided.' }
+
+    if ($SkipLaunch) {
+        Write-Host ''
+        Write-Host 'PASS: bundle layout, OpenConsole hash and metadata verified (launch half skipped).' -ForegroundColor Green
+        return
+    }
 
     $smokeLog = Join-Path $extractRoot 'm2-pane-smoke.log'
     if (Test-Path -LiteralPath $smokeLog) { Remove-Item -LiteralPath $smokeLog -Force }

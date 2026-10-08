@@ -81,6 +81,8 @@ pwsh -NoProfile -File scripts/Share-Portable.ps1   # 生成 artifacts/WinPaneDoc
 
 `scripts/Test-Portable-Bundle.ps1` 会把该 zip 解压到带空格的临时路径，启动解出来的 GUI 并跑 `--pane-smoke`，校验必需的运行时文件、`OpenConsole.exe` 的 SHA-256 与 `build-metadata.txt` 一致，并从诊断日志确认真的起起了 ConPTY 会话与 Shell 进程。测试用 `--instance-id` 与 `--layout-path` 隔离，**不会连接或结束已安装版本的会话**。
 
+加 `-SkipLaunch` 只做布局、哈希与元数据检查，跳过启动 GUI 的那一半。**GitHub Actions 用这个模式**：runner 没有真实桌面会话，而 `TerminalControl` 的 `HwndHost` 需要窗口站，和 `Test.ps1` 把桌面门放在 `-IncludeDesktop` 后面是同一个原因。启动那一半请在本机跑。
+
 > **未签名**：zip 内的程序没有 Authenticode 签名，首次运行 SmartScreen 可能提示"未知发布者"，选择"更多信息 → 仍要运行"即可。
 
 ### 打包成可安装的 MSIX

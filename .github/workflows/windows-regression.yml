@@ -70,6 +70,20 @@ jobs:
         shell: pwsh
         run: pwsh -NoProfile -File scripts/M10.Build-Msix.ps1
 
+      - name: Build portable bundle
+        shell: pwsh
+        run: pwsh -NoProfile -File scripts/Share-Portable.ps1
+
+      # The portable zip is what third parties actually download, so it gets the
+      # same treatment as the MSIX rather than being trusted because it came from
+      # the same commit. -SkipLaunch is required here: the launch half starts the
+      # WPF GUI, and TerminalControl's HwndHost needs a real window station, which
+      # this runner does not have. That is the same reason Test.ps1 keeps its
+      # desktop gates behind -IncludeDesktop. Run the full gate locally.
+      - name: Verify the portable bundle layout
+        shell: pwsh
+        run: pwsh -NoProfile -File scripts/Test-Portable-Bundle.ps1 -SkipLaunch
+
       - name: Show build metadata
         shell: pwsh
         run: Get-Content artifacts/msix-stage/build-metadata.txt
@@ -80,4 +94,12 @@ jobs:
           path: |
             artifacts/*.msix
             artifacts/msix-stage/build-metadata.txt
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: winpanedock-portable
+          path: |
+            artifacts/WinPaneDock-*-x64-portable.zip
+            artifacts/share-stage/build-metadata.txt
           if-no-files-found: error
