@@ -4,7 +4,7 @@ Windows 桌面终端工作区管理器。WPF 界面嵌入官方 Windows Terminal
 
 应用显示名称为 WinPaneDock。兼容现有会话与配置的 `cmux.exe` 命令、MSIX 身份和内部路径保持原名。
 
-> **仓库状态：开发中的源码，不是可直接安装的发布版本。** 这里不提供预编译安装包。请按[从源码构建](#从源码构建)自行构建。最新进展与未完成项见 [路线图](CMUX-Windows-ROADMAP.md)，可靠性与发布状态见 [docs/M10-RELIABILITY.md](docs/M10-RELIABILITY.md)。
+> **仓库状态：开发中的源码。** MSIX 安装包需要受信任的代码签名证书才能装到别的机器上，因此仓库不提供预编译 MSIX。但提供**免安装 zip**：`scripts/Share-Portable.ps1` 产出 `artifacts/WinPaneDock-<version>-x64-portable.zip`，解压后直接运行 `Cmux.Spike.Terminal.exe`，不需要安装、不需要签名、不需要管理员权限，也**不需要装 Windows Terminal**（`OpenConsole.exe` 随包分发）。它仍是预览版本，正式发布签名与键盘到渲染延迟验收未完成，见 [已知问题](#已知问题)。最新进展与未完成项见 [路线图](CMUX-Windows-ROADMAP.md)，可靠性与发布状态见 [docs/M10-RELIABILITY.md](docs/M10-RELIABILITY.md)。
 
 ## 功能
 
@@ -70,6 +70,18 @@ dotnet build spikes/M0.Terminal.Wpf/M0.Terminal.Wpf.csproj -c Release
 ```
 
 **不需要打包 MSIX，也不需要签名。** 上面的 `dotnet build` 会把 GUI、SessionHost、CLI 和 OpenConsole 一起复制到输出目录，可直接运行。
+
+### 打包成免安装 zip（可直接分享给别人）
+
+```powershell
+pwsh -NoProfile -File scripts/Share-Portable.ps1   # 生成 artifacts/WinPaneDock-<version>-x64-portable.zip
+```
+
+对方解压后运行 `Cmux.Spike.Terminal.exe` 即可。包里已含 `OpenConsole.exe`、`LICENSE` 与 `NOTICE`，目标机器不需要 .NET 运行时、**不需要安装 Windows Terminal**，也不需要注册任何 AppX 包。压缩包约 70 MB，解压后约 163 MB。
+
+`scripts/Test-Portable-Bundle.ps1` 会把该 zip 解压到带空格的临时路径，启动解出来的 GUI 并跑 `--pane-smoke`，校验必需的运行时文件、`OpenConsole.exe` 的 SHA-256 与 `build-metadata.txt` 一致，并从诊断日志确认真的起起了 ConPTY 会话与 Shell 进程。测试用 `--instance-id` 与 `--layout-path` 隔离，**不会连接或结束已安装版本的会话**。
+
+> **未签名**：zip 内的程序没有 Authenticode 签名，首次运行 SmartScreen 可能提示"未知发布者"，选择"更多信息 → 仍要运行"即可。
 
 ### 打包成可安装的 MSIX
 
@@ -144,6 +156,7 @@ pwsh -NoProfile -File scripts/M12.Performance-Baseline.ps1   # 只读采样，�
 - **终端设置受限**：WPF 控件没有背景透明度与 Scrollback 长度接口，原生层历史长度固定为 9001 行，见 [docs/M1.2-SETTINGS.md](docs/M1.2-SETTINGS.md)
 - **cwd 自动上报只覆盖 PowerShell**：CMD、Git Bash、WSL 和自定义 Shell 没有自动 cwd hook，需手动 `cmux cwd <目录>`，见 [docs/M7-GIT-CONTEXT.md](docs/M7-GIT-CONTEXT.md)
 - **内置冒烟门仍有失败**：`--tab-smoke`、`--cwd-smoke`、`--palette-smoke` 在当前代码下失败（`OpenProcess` 访问被拒、cwd 未上报、命令面板关闭未移除 Pane），详见 [docs/OPTIMIZATION-REVIEW-2026-09-24.md](docs/OPTIMIZATION-REVIEW-2026-09-24.md)
+- **`--pane-smoke` 的断言不可靠**：该门读取 `Connection.ProcessId`，而该字段由 `RunStartAsync` 异步赋值，因此在冷启动（含免安装包）时报 3 次 "A pane has no shell" 并以 1 退出，即使 Shell 实际已启动。这是既有问题，开发构建同样如此；`scripts/Test-Portable-Bundle.ps1` 因此改以诊断日志中的 `terminal.started` 为准
 - **复杂 TUI 恢复有边界**：每个会话最多缓存 100 万字符，超出后无法保证复杂 TUI 完整恢复；宿主崩溃后不会自动重建原 Shell，见 [docs/M10-RELIABILITY.md](docs/M10-RELIABILITY.md)
 - **未完成验收**：正式发布签名、完整"键盘输入到终端渲染"延迟量化验收
 - **无自动化测试项目**：全部回归依赖 PowerShell 冒烟脚本，仓库中没有 xUnit 测试项目

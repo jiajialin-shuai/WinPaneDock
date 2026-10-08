@@ -18,6 +18,10 @@
 
 ## 安装与当前验证
 
+免安装分发路径独立于签名：`scripts/Share-Portable.ps1` 发布同一批自包含二进制到 `artifacts/share-stage`，连同 `OpenConsole.exe`、LICENSE、NOTICE、`build-metadata.txt` 和使用说明压成 `artifacts/WinPaneDock-<version>-x64-portable.zip`，0.1.6.8 实测约 70 MB（解压约 163 MB）。清单只声明 `runFullTrust`，代码不依赖 `Package.Current` 或 `Windows.ApplicationModel`，运行时从 `AppContext.BaseDirectory` 解析 `OpenConsole.exe`，因此解压即可运行，不需要安装、不需要管理员权限、目标机器不需要 .NET 运行时，也不需要安装 Windows Terminal。
+
+`scripts/Test-Portable-Bundle.ps1` 是该路径的门：解压到带空格的临时目录后启动解出的 GUI，跑 `--pane-smoke` 并从诊断日志确认真的生成了 ConPTY 会话与 Shell PID，同时校验 `OpenConsole.exe` 的 SHA-256 与 `build-metadata.txt` 一致。门用 `--instance-id` 与 `--layout-path` 隔离，不连接也不结束已安装版本的会话。**注意门自身断言不可靠**：`RunPaneSmokeAsync` 读 `Connection.ProcessId`，该字段由 `RunStartAsync` 异步赋值，冷启动时报 3 次 "A pane has no shell" 并退出码 1，而诊断日志显示 Shell 正常启动（实测 3 个会话，PID 均非零）；对开发构建跑同一门得到完全相同的失败，属既有问题，故以日志为准。
+
 `scripts/M10.Build-Msix.ps1` 发布自包含 App、SessionHost、CLI，复制 OpenConsole、清单和图标，产出 `artifacts/WinPaneDock-<version>-x64-unsigned.msix`（`<version>` 取自 `Directory.Build.props`）。`scripts/M10.Sign-Dev-Msix.ps1` 生成同版本号的 `-dev.msix`；签名验证为 Valid。安装包显示名称已改为 WinPaneDock，内部包身份与 `cmux.exe` 别名保持兼容。安装用 `powershell.exe -NoProfile -File scripts\M10.Activate-Dev-Update.ps1`；安装别名 `cmux.exe` 可用，`cmux list` 已读到运行中的工作区。升级前需先确认 GUI 与 SessionHost 的活动会话。
 
 本机注册版本以 `Get-AppxPackage -Name Cmux.Windows` 的输出为准，其 `InstallLocation` 即 GUI 与 SessionHost 所在目录。源码与开发包不自动替换已注册版本。
